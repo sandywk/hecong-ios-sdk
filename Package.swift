@@ -13,6 +13,11 @@ let package = Package(
     .library(name: "HecongChatSDK", targets: ["HecongChatSDK"])
   ],
   targets: [
-    .target(name: "HecongChatSDK", path: "Sources/HecongChatSDK")
+    .target(
+      name: "HecongChatSDK", path: "Sources/HecongChatSDK",
+      // iOS 隐私清单必须随包交付(苹果 2024-05 起对用了 Required Reason API 的第三方 SDK
+      // 强制要求)。不带的话每个接入方都要在自己主工程里替我们补声明,否则提交 App Store
+      // 会收到 ITMS-91053 类警告 —— 那是 SDK 的责任,不该推给租户。详见该文件头注释。
+      resources: [.copy("PrivacyInfo.xcprivacy")])
   ]
 )

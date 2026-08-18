@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  iOS 隐私清单(Privacy Manifest)—— 苹果自 2024-05 起对使用 Required Reason API 的
+  第三方 SDK 强制要求。缺失时接入方提交 App Store 会收到 ITMS-91053 类警告乃至被拒。
+
+  🔴 **这是 SDK 的责任,不能推给租户**:没有它,每个接入方都要在自己主工程的清单里
+  替我们补一段声明 —— 而他们既不知道我们用了哪些 API,也不该知道。
+
+  ── 已核实的事实(改这个文件前先看这里)──
+
+  1. **Required Reason API 全仓只用了 UserDefaults 一项**(逐类 grep 核过:文件时间戳 /
+     系统启动时间 / 磁盘空间 / 活跃键盘 / 处理器数 均为 0 处)。用在两处:
+     `HecongChat.swift` 的运行时缓存(apiBase)、`HecongAnonymousIdStore.swift` 的
+     匿名号 Keychain 降级层。
+  2. **理由码取 `C56D.1`** —— 苹果对 UserDefaults 给了四个码,按用途选:
+       CA92.1 = 只在 app 自己内部访问;1C8F.1 = App Group 共享;
+       **C56D.1 = 从 SDK 访问**(我们的场景);AC6B.1 = 读 MDM 托管配置。
+     ⚠️ 我们是第三方 SDK,**不是** CA92.1。填错码会以 ITMS-91055 被拒。
+  3. **NSPrivacyTracking = false**:SDK 不做跨 app/网站追踪,也不接任何广告标识
+     (无 IDFA / IDFV / 广告 SDK)。TrackingDomains 因此为空数组。
+
+  ── NSPrivacyCollectedDataTypes 的填写口径(需要业务复核的部分)──
+
+  只声明**SDK 自身会传输**的数据。其中「姓名/邮箱/电话」是**接入方主动调 identify 传入**的
+  可选资料 —— SDK 不主动采集,但确实会传输,按苹果口径仍需声明。
+  ⚠️ 声明这三项会体现在接入方的 App Store 隐私标签上;若将来产品口径调整,这里要同步。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeCustomerSupport</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeName</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeEmailAddress</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePhoneNumber</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherDiagnosticData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C56D.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
