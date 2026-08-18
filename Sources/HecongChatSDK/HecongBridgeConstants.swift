@@ -9,7 +9,7 @@ import Foundation
 
 enum HecongBridgeConstants {
   /// 壳包版本(context.shellVersion,诊断/灰度用;发版时更新)
-  static let shellVersion = "0.1.0"
+  static let shellVersion = "0.1.1"
 
   /// document-start 注入的 context 全局 key(桥协议 §二)
   static let contextKey = "__hecongAppContext"
@@ -43,9 +43,21 @@ enum HecongBridgeConstants {
   /// 明文无泄露顾虑的理由同 H5 侧(本仓不开源;DSN 只能写入不能读取)。
   static let errorDsn = "https://39f360035c524069bbf16994bf4d0029@beacon.aihecong.com/2"
 
-  /// 上报环境标签(平台按它过滤)。同 H5「本地也上报,靠 environment 区分」的定案
-  /// (brand-config.ts:121 owner 2026-07-27 拍板)。⚠️ 对外发版时改 "production"。
-  static let errorEnvironment = "development"
+  /// 上报环境标签(监控平台按它过滤)。同 H5「本地也上报,靠 environment 区分」的定案
+  /// (brand-config.ts:121 owner 2026-07-27 拍板)。
+  ///
+  /// 🔴 **按构建类型自动区分,不写死**(0.1.1 修正:0.1.0 发出去时是写死的 "development",
+  /// 等于线上租户的错误全被打上开发标签,与本地噪音混在一起 —— 上报做得再细也白搭)。
+  /// 反过来写死 "production" 同样错:我们自己跑示范 APP 的错误会污染线上数据。
+  /// 源码分发下这个宏取决于**租户编译时的构建配置**:他们 Debug 调试 → development,
+  /// Release 上架 → production,正是我们想要的分界。
+  static let errorEnvironment: String = {
+    #if DEBUG
+      return "development"
+    #else
+      return "production"
+    #endif
+  }()
 
   // MARK: - 本地骨架装载(2026-08-17 改版:APP 内置骨架 + 静态域拉插座,app-sdk-plan §二)
 
