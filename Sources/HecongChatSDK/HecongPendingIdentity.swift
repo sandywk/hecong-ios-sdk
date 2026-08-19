@@ -50,4 +50,7 @@ protocol HecongChatCommandTarget: AnyObject {
   func identify(userId: String, profile: [String: Any]?, data: [String: Any]?)
   func updateUser(profile: [String: Any]?, data: [String: Any]?)
   func resetUser()
+  /// 通用命令透传(桥协议 §三.2)。身份三件保留具名方法是因为它们要过门面的合并容器;
+  /// 其余命令一律走这条 —— **H5 将来新增命令时壳零改动**(具名方法只是便利糖)。
+  func sendCommand(_ type: String, payload: [String: Any]?)
 }

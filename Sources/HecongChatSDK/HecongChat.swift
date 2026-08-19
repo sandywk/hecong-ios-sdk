@@ -35,6 +35,9 @@ public final class HecongChat: NSObject {
   /// 待重放身份(聊天页还没开时调 identify,页面起来后自动补发;详 HecongPendingIdentity)
   private let pendingIdentity = HecongPendingIdentity()
 
+  /// 待重放壳状态(指派技能组 / 注册按钮;详 HecongPendingShellState)
+  private let pendingShell = HecongPendingShellState()
+
   /// 已挂载的聊天视图。**弱引用表** —— 门面是单例、生命周期与 APP 同,强引用会把
   /// 关掉的聊天页永久留在内存里(经典单例泄漏)。视图可同时存在多个(见 setChatVisible)。
   private let targets = NSHashTable<AnyObject>.weakObjects()
@@ -123,6 +126,79 @@ public final class HecongChat: NSObject {
     forEachTarget { $0.resetUser() }
   }
 
+  // MARK: - 会话指派(app-sdk-plan.md §10.7 / sdk-agent-routing.md)
+
+  /// 指定本次咨询由哪个**技能组**接待。可在打开聊天页之前调(自动重放)。
+  ///
+  /// 传 nil 清除。要细配降级策略用 `setRouting(_ routing:)` 那个重载。
+  /// ⚠️ **只在"聊天页开着时要换组"或"启动前动态决定"才用它** —— 值固定的场景直接配
+  /// `HecongChatConfig.routing` 更省事(走 URL 档,连桥都不用等)。
+  @objc public func setRouting(_ skillGroup: String?) {
+    guard let skillGroup = skillGroup, !skillGroup.isEmpty else {
+      setRouting(nil as HecongRouting?)
+      return
+    }
+    setRouting(HecongRouting(skillGroup: skillGroup))
+  }
+
+  /// 同上,带降级策略(`fallback` = "group" / "normal" / "leave_message")。
+  /// ObjC 侧选择器显式改名 `setRoutingOptions:` —— 与上面的字符串重载**同名会撞选择器**
+  /// (ObjC 不认识 Swift 的重载,两者都会映射成 `setRouting:`,编译期直接报错)。
+  @objc(setRoutingOptions:) public func setRouting(_ routing: HecongRouting?) {
+    pendingShell.setRouting(routing)
+    // payload 里的 `routing` 显式给 NSNull 转成的 nil —— H5 侧 `{ routing: null }` 即清除语义
+    let payload: [String: Any] = ["routing": routing?.payload() as Any? ?? NSNull()]
+    forEachTarget { $0.sendCommand("setRouting", payload: payload) }
+  }
+
+  // MARK: - 选择器与自定义按钮(契约 §九;商品/订单/文章卡片的入口)
+
+  /// 往输入区加一个自定义按钮。点击 → `hecongChat(didClickAction:)` 回调。
+  ///
+  /// - Parameters:
+  ///   - slot: `"attach"` 附件面板(📎 里,收着)/ `"quick"` 快捷按钮区(输入框正上方,显眼)
+  ///   - icon: 可选内联 SVG 串(`<svg` 开头);不给用通用图标
+  ///
+  /// 同 id 重复注册 = 覆盖。可在打开聊天页之前调(自动重放,页面重建后按钮仍在)。
+  @objc public func registerAction(id: String, label: String, icon: String?, slot: String) {
+    guard !id.isEmpty, !label.isEmpty else { return }
+    var payload: [String: Any] = ["id": id, "label": label, "slot": slot]
+    if let icon = icon, !icon.isEmpty { payload["icon"] = icon }
+    pendingShell.registerAction(payload)
+    forEachTarget { $0.sendCommand("registerAction", payload: payload) }
+  }
+
+  /// 撤掉自定义按钮(id 不存在 = 无副作用)。
+  @objc public func unregisterAction(_ id: String) {
+    pendingShell.unregisterAction(id)
+    forEachTarget { $0.sendCommand("unregisterAction", payload: ["id": id]) }
+  }
+
+  /// 供给选择器数据。`picker` = "product" / "order" / "article";`items` 是卡片字典数组
+  /// (字段见 `packages/models/src/message/card.ts`,如商品:`cardType`/`title`/`imageUrl`/`price`)。
+  ///
+  /// ⚠️ **在 `didClickAction` 回调里现取现给**,别在启动时灌一次了事 —— 商品/订单列表
+  /// 随登录态与库存变化,陈旧列表发出去的是错卡片。上限 50 条(超出 H5 侧自动截断)。
+  /// 聊天页没开时调 = 无效(**刻意不重放**,理由见 HecongPendingShellState 头注释)。
+  @objc public func setPickerData(_ picker: String, items: [[String: Any]]) {
+    forEachTarget { $0.sendCommand("setPickerData", payload: ["picker": picker, "items": items]) }
+  }
+
+  /// 打开选择器面板(通常紧跟 `setPickerData` 调用)。聊天页没开时无效。
+  @objc public func openPicker(_ picker: String) {
+    forEachTarget { $0.sendCommand("openPicker", payload: ["picker": picker]) }
+  }
+
+  /// **通用命令透传口**(桥协议 §三.2)—— 逃生梯,不是首选。
+  ///
+  /// 上面那些具名方法是承诺(有类型、有文档);本方法用于**壳版本还没跟上的新命令** ——
+  /// H5 侧新增命令后,不必等我们发原生包、也不必等你升级 SDK,自己拼 type + payload 就能调。
+  /// H5 不认识的 type 会被安全丢弃(返回 unknown_command 并留痕),不会崩。
+  @objc public func sendCommand(_ type: String, payload: [String: Any]?) {
+    guard !type.isEmpty else { return }
+    forEachTarget { $0.sendCommand(type, payload: payload) }
+  }
+
   // MARK: - 聊天视图协作(internal,视图起来时交接)
 
   /// 聊天视图挂载 → 登记 + **重放已登记的身份**(命令进视图自己的队列,桥 ready 后发出)。
@@ -131,6 +207,9 @@ public final class HecongChat: NSObject {
   /// (两级队列各司其职,详 HecongPendingIdentity 头注释)。
   func attachTarget(_ target: HecongChatCommandTarget) {
     targets.add(target)
+    // 壳状态(指派组 / 注册按钮)与身份**都要重放**,且互不依赖 —— 身份可能没有(匿名访客),
+    // 那时按钮和指派组照样要生效,所以壳状态重放不能挂在身份的 guard 后面
+    pendingShell.replay(into: target)
     guard let userId = pendingIdentity.userId else { return }
     target.identify(
       userId: userId,

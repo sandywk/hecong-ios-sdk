@@ -106,6 +106,14 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     send(["type": "userReset"])
   }
 
+  /// 通用命令透传(桥协议 §三.2;门面的具名方法最终都落到这里)。
+  /// payload 为 nil 时不带该键 —— H5 侧 `userReset` 一类无参命令本就不看 payload。
+  @objc public func sendCommand(_ type: String, payload: [String: Any]?) {
+    var cmd: [String: Any] = ["type": type]
+    if let payload = payload { cmd["payload"] = payload }
+    send(cmd)
+  }
+
   /// 手动指定深浅色。默认档(`host`)已经自动跟随 APP,**一般不需要调这个** ——
   /// 只有宿主想临时压一个档位(例如页面内的独立开关)时才用。
   @objc public func setColorScheme(_ scheme: String) {
@@ -301,6 +309,14 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     var parts = URLComponents(string: HecongBridgeConstants.localPageBase)!
     var items = [URLQueryItem(name: "c", value: config.channelId)]
     for (k, v) in config.extraQuery { items.append(URLQueryItem(name: k, value: v)) }
+    // 指派技能组的**启动档**(sdk-agent-routing.md §3.3 的 sg/fb/fbg,与对话链接完全同参)。
+    // 走 query 而不是等桥 ready 再发命令:值在首帧就到位,H5 侧零改动(URL 解析链早已有)。
+    // extraQuery 显式写了 sg 则尊重它(高级用法优先,同 hh 的先例)。
+    if let routing = config.routing, !items.contains(where: { $0.name == "sg" }) {
+      items.append(URLQueryItem(name: "sg", value: routing.skillGroup))
+      if let fb = routing.fallback { items.append(URLQueryItem(name: "fb", value: fb)) }
+      if let fbg = routing.fallbackGroup { items.append(URLQueryItem(name: "fbg", value: fbg)) }
+    }
     if !items.contains(where: { $0.name == "hh" || $0.name == "hideHeader" }) {
       items.append(URLQueryItem(name: "hh", value: "1"))
     }
@@ -443,12 +459,12 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       }
     case "open-url":
       if let raw = payload?["url"] as? String, let url = URL(string: raw) {
-        if delegate?.hecongChat?(handleOpenUrl: url) != true { openExternally(url) }
+        openOutside(url) // 与整页跳转、tel/mailto 共用一个出口
       }
     case "download":
       if let raw = payload?["url"] as? String, let url = URL(string: raw) {
         let filename = payload?["filename"] as? String
-        if delegate?.hecongChat?(handleDownload: url, filename: filename) != true {
+        if !askHost({ $0.hecongChat?(handleDownload: url, filename: filename) == true }) {
           openExternally(url)
         }
       }
@@ -457,6 +473,13 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       HecongSessionEvents.dispatch(payload) { action in
         if let facade = HecongChat.shared.delegate { action(facade) }
         notifyOwnDelegate(action) // 与门面同一对象时跳过,避免同一件事回调两次
+      }
+    case "action-click":
+      // 壳注册的自定义按钮被点(桥协议 §四)。门面与视图两处 delegate 都报,notifyOwnDelegate
+      // 负责去重(租户常把同一个对象两边都设,不去重会把商品面板开两次)
+      if let id = payload?["id"] as? String, !id.isEmpty {
+        HecongChat.shared.delegate?.hecongChat?(didClickAction: id)
+        notifyOwnDelegate { $0.hecongChat?(didClickAction: id) }
       }
     case "loader-error":
       // 骨架里插座 script 拉取失败(断网/静态域不可达)→ 原生兜底页(骨架形态下
@@ -521,6 +544,29 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   ///
   /// 仍拒绝 `javascript:` `file:` 等借道 scheme,但**拒绝要留痕**(上报),不再静默丢弃。
   private static let allowedSchemes: Set<String> = ["http", "https", "tel", "mailto", "sms", "geo"]
+
+  /// 「要离开客服页」的**唯一出口**:网页跳转 / 电话 / 邮箱 / 短信全走这里
+  /// (与安卓 HecongChatView.openOutside 同构)。
+  ///
+  /// 先问宿主(`hecongChat(handleOpenUrl:)` 返回 true = 租户自己处理,例如跳他 APP 里的
+  /// 商品详情页);不接管才用默认方式(系统浏览器 / 拨号 / 邮件)。收成一处的意义:
+  /// 租户实现一个回调就覆盖聊天页里**所有**往外跳的动作,不用分辨来源。
+  private func openOutside(_ url: URL) {
+    if askHost({ $0.hecongChat?(handleOpenUrl: url) == true }) { return }
+    openExternally(url)
+  }
+
+  /// 问宿主"这件事你接管吗" —— **门面与视图两级都问**,任一返回 true 即接管。
+  ///
+  /// 为什么两级都要问(2026-08-19 审出的不一致):自嵌聊天页的租户常常只设门面 delegate,
+  /// 只问视图那一级的话,他的 `handleOpenUrl` / `handleDownload` 永远收不到,
+  /// 而链接照样跳走,他还以为自己拦住了。同一个对象两处都设时按身份去重,不会问两遍。
+  private func askHost(_ ask: (HecongChatDelegate) -> Bool) -> Bool {
+    let facade = HecongChat.shared.delegate
+    if let facade = facade, ask(facade) { return true }
+    if let own = delegate, (facade == nil || own !== facade), ask(own) { return true }
+    return false
+  }
 
   private func openExternally(_ url: URL) {
     let scheme = url.scheme?.lowercased() ?? ""
@@ -599,13 +645,24 @@ extension HecongChatViewController: WKNavigationDelegate {
   ) {
     guard let url = navigationAction.request.url else { return decisionHandler(.allow) }
     let scheme = url.scheme?.lowercased() ?? ""
-    // 骨架页自身 / 线上资源 / 页面内部导航照常放行
-    if scheme == HecongBridgeConstants.localScheme || scheme == "http" || scheme == "https"
-      || scheme == "about" || scheme == "data" || scheme == "blob" {
+    // 骨架页自身与内部机制照常放行(about/data/blob 是页面内部用的伪协议,不是"往外跳")
+    if scheme == HecongBridgeConstants.localScheme || scheme == "about" || scheme == "data"
+      || scheme == "blob" {
       return decisionHandler(.allow)
     }
+    // 🔴 iframe 内导航放行:自定义页面模块用受限 sandbox iframe 嵌外部网址
+    // (shell-kit/custom-page-module.ts),那是**期望在内部加载**的,拦了等于把该模块打死。
+    // targetFrame == nil 表示"要开新窗口"(target=_blank),那属于往外跳,不放行。
+    if let target = navigationAction.targetFrame, !target.isMainFrame {
+      return decisionHandler(.allow)
+    }
+    // 🔴 主框架的任何跳转一律不在 WebView 内加载(2026-08-19 owner 定调,与安卓
+    // HecongChatView.shouldOverrideUrlLoading 同构):**聊天窗是单页应用** —— 只装一个骨架页,
+    // 内部换页走 history API(不触发本回调),子资源走 URLSchemeHandler/网络层。
+    // 所以走到这里的主框架导航必然是"要离开客服页";不拦的后果是客服页被外部网页整个顶掉,
+    // 标题栏还写着「在线客服」而里面已是别人的网站,访客走丢。
     decisionHandler(.cancel)
-    openExternally(url)
+    openOutside(url)
   }
 
   public func webView(

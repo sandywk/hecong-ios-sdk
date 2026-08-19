@@ -23,6 +23,12 @@ public final class HecongChatConfig: NSObject {
   /// 缺省时壳自动带 hh=1 —— APP 有原生导航,H5 不画标题栏)
   @objc public var extraQuery: [String: String] = [:]
 
+  /// 指派技能组(**启动档**;`sdk-agent-routing.md` / `app-sdk-plan.md §10.7`)。
+  ///
+  /// 租户平台自己算好了"这个客户该由谁接待"时用它 —— 值会拼进骨架页 query(`?sg=/fb=/fbg=`),
+  /// 走 H5 既有的 URL 解析链。**聊天页开着时要换组**用 `HecongChat.shared.setRouting(...)`。
+  @objc public var routing: HecongRouting?
+
   /// 深浅色四档(**默认 `host`:聊天页自动跟随你的 APP,零代码**):
   ///
   /// - `host`:**默认**。跟随宿主 APP 当前深浅色(读 traitCollection),APP 切换时实时同步
@@ -57,6 +63,39 @@ public final class HecongChatConfig: NSObject {
   }
 }
 
+/// 指派技能组的取值(`sdk-agent-routing.md §3.1`)。
+///
+/// **用组名不用 ID** 是规划的既定决策(租户零配置接入,代码可读);组名允许中文,
+/// 壳会自动 URL 编码。降级策略缺省 = `normal`(找不到该组时走正常轮询)。
+@objc(HecongRouting)
+public final class HecongRouting: NSObject {
+  /// 技能组名称(工作台里那个名字,允许中文)
+  @objc public let skillGroup: String
+  /// 找不到 / 无人在线时怎么办:`group`(转兜底组,须给 fallbackGroup) / `normal` / `leave_message`
+  @objc public var fallback: String?
+  /// `fallback == "group"` 时的兜底组名
+  @objc public var fallbackGroup: String?
+
+  @objc public init(skillGroup: String) {
+    self.skillGroup = skillGroup
+    super.init()
+  }
+
+  @objc public convenience init(skillGroup: String, fallback: String?, fallbackGroup: String?) {
+    self.init(skillGroup: skillGroup)
+    self.fallback = fallback
+    self.fallbackGroup = fallbackGroup
+  }
+
+  /// 桥命令 payload(`setRouting`);URL 档另走 query,两处形状刻意一致便于对照
+  func payload() -> [String: Any] {
+    var out: [String: Any] = ["skillGroup": skillGroup]
+    if let fallback = fallback { out["fallback"] = fallback }
+    if let fallbackGroup = fallbackGroup { out["fallbackGroup"] = fallbackGroup }
+    return out
+  }
+}
+
 /// 壳 → 宿主 APP 的事件回调(全部可选;不实现即走壳内默认行为)。
 @objc(HecongChatDelegate)
 public protocol HecongChatDelegate: AnyObject {
@@ -87,6 +126,13 @@ public protocol HecongChatDelegate: AnyObject {
   /// ⚠️ **不要假设它等于 `config.deviceId`**:H5 可能 adopt 后端下发的档案匿名号
   /// (桥协议 §二.2 第 2 条),一律以本回调的值为准。
   @objc optional func hecongChatDidChangeAnonymousId(_ anonymousId: String)
+
+  /// 自定义按钮被点(`HecongChat.registerAction` 注册的那些;桥协议 §四 `action-click`)。
+  ///
+  /// 典型用法 —— 商品/订单选择器(`sdk-public-api-contract.md §九`):
+  /// 收到回调 → 现取自家商品列表 → `setPickerData("product", items)` → `openPicker("product")`,
+  /// 访客点中一条即作为卡片消息发给客服。**数据现取而不是提前灌**:列表常随登录态/库存变化。
+  @objc optional func hecongChat(didClickAction id: String)
 
   /// 页面加载失败(断网 / 静态域不可达)。壳已画内置兜底页 + 重试按钮;本回调供宿主
   /// 上报自家监控或换成自己的兜底 UI(换 UI 时自行盖住聊天视图,壳不感知)。
