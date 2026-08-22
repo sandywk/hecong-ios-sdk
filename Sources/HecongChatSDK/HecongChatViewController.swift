@@ -20,6 +20,16 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   var immersive = false
   /// 弹层档标记(门面 `presentSheet` 设)。顶栏由**系统导航栏**画,这里只用于形态判定。
   var sheetMode = false
+  /// 沉浸档以 push 方式进栈(门面 presentImmersive 设):本 VC 负责「进场隐藏系统导航栏 / 离场还原 /
+  /// 隐藏期间保活系统侧滑返回」三件事,租户一行调用零感知。
+  var pushedImmersive = false
+  /// 进场前宿主导航栏的隐藏状态(离场按它还原,别把宿主本来就隐藏的栏"恢复"成显示)。
+  /// **只在第一次进场捕获**:被别的页盖住再回来时 viewWillAppear 会再触发,那时栏已经被我们藏了,
+  /// 再捕获就把"宿主本来显示"记成"隐藏",最终 pop 回去宿主的导航栏就丢了(2026-08-22 自审抓出)。
+  private var navBarWasHidden = false
+  private var navBarStateCaptured = false
+  /// 系统侧滑返回保活件(导航栏隐藏时 UIKit 会禁掉侧滑,由它接管 delegate;详该文件头)
+  private var swipeBackKeeper: HecongSwipeBackKeeper?
   /// H5 顶栏是不是深底(capability `header-style`);nil = 还没收到,状态栏保持系统默认
   private var headerIsDark: Bool?
   /// 自绘顶栏 —— **只在标准档且宿主没有导航栏时**才有(有导航栏就是宿主那条,SDK 不画)
@@ -90,7 +100,12 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     endBackgroundTask()
   }
 
-  deinit { destroy() }
+  // 侧滑 delegate 兜底还回(VC 没走到 viewWillDisappear 就释放的极端路径):UIGestureRecognizer.delegate
+  // 是 weak,我们没了它就变 nil,根页侧滑会触发 UIKit 的经典卡死。
+  deinit {
+    swipeBackKeeper?.restore()
+    destroy()
+  }
 
   // MARK: - 公共命令面(壳 → H5,桥协议 §三;ready 前调用自动排队)
 
@@ -245,7 +260,10 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   ///   ① 宿主 Info.plist 若把 `UIViewControllerBasedStatusBarAppearance` 设成 NO(老工程常见),
   ///      本方法**整个失效**(那是"状态栏样式全局说了算"的开关);
   ///   ② 非全屏 modal 需要 `modalPresentationCapturesStatusBarAppearance = true` 才轮得到我们
-  ///      —— 沉浸档用的是 .fullScreen,天然捕获,不必额外设。
+  ///      —— 沉浸档 modal 形态用的是 .fullScreen,天然捕获,不必额外设;
+  ///   ③ 沉浸档 **push** 形态(2026-08-22 起有导航栈就 push)靠宿主 `UINavigationController` 转发:
+  ///      导航栏隐藏时它默认把 `childForStatusBarStyle` 交给 topViewController(实测 iOS 26 成立),
+  ///      宿主 nav 子类若覆盖了这个方法则轮不到我们,属宿主自定行为。
   public override var preferredStatusBarStyle: UIStatusBarStyle {
     guard immersive, let dark = headerIsDark else { return .default }
     return dark ? .lightContent : .darkContent // 深底配白图标,浅底配黑图标
@@ -256,11 +274,46 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     keyboardGuard?.hostDidLayout()
   }
 
+  /// 进场:沉浸档 push 形态隐藏系统导航栏(H5 画顶栏);凡是「在导航栈里 + 导航栏隐藏」
+  /// (沉浸档 push / 租户嵌入档自己隐藏了栏)就保活系统侧滑返回 —— 否则 UIKit 会把侧滑禁掉,
+  /// 客户只能找 ✕(2026-08-22 owner 真机:沉浸档 / 嵌入档手势返回无效)。
+  /// 保活件只在 delegate 仍是 UIKit 默认值时接管,宿主自己管了就不碰(详 HecongSwipeBackKeeper)。
+  public override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    guard let nav = navigationController else { return }
+    if pushedImmersive {
+      if !navBarStateCaptured {
+        navBarWasHidden = nav.isNavigationBarHidden
+        navBarStateCaptured = true
+      }
+      nav.setNavigationBarHidden(true, animated: animated)
+    }
+    installSwipeBackKeeperIfNeeded()
+  }
+
+  /// 「在导航栈里 + 导航栏隐藏 + delegate 仍是 UIKit 默认」→ 接管侧滑。viewWillAppear / viewDidAppear 各查一次:
+  /// 租户嵌入档有人在 viewDidAppear 才藏栏(也常见),只查 will 那一刻会漏(审查指出)。幂等。
+  private func installSwipeBackKeeperIfNeeded() {
+    guard swipeBackKeeper == nil, let nav = navigationController, nav.isNavigationBarHidden else { return }
+    let keeper = HecongSwipeBackKeeper(navigationController: nav)
+    if keeper.install() { swipeBackKeeper = keeper }
+  }
+
+  /// 离场(pop / 被盖住)还原:导航栏回到进场前的状态,侧滑 delegate 还给原主。
+  public override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    swipeBackKeeper?.restore()
+    swipeBackKeeper = nil
+    if pushedImmersive, let nav = navigationController {
+      nav.setNavigationBarHidden(navBarWasHidden, animated: animated)
+    }
+  }
+
   /// 聊天页可见期间暂停门面的未读轮询 —— 此刻 WS 是权威来源(§10.2),两个源同时跑会打架。
   /// 未开未读跟踪的租户(默认档)这两行是空转,零开销。
   public override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
-
+    installSwipeBackKeeperIfNeeded() // 宿主在 viewDidAppear 才藏栏的情况
     HecongChat.shared.setChatVisible(true)
   }
 

@@ -301,7 +301,12 @@ public final class HecongChat: NSObject {
   }
 
   /// **沉浸档**:整页交给 H5(渠道后台配的那条彩色标题栏 + 右上 ✕ 退出),适合想要整页品牌感的租户。
-  /// 这一档**没有返回栈,✕ 是唯一出口**,所以保留 ✕ —— 与标准档的"左上返回"刻意区分。
+  ///
+  /// **呈现方式(2026-08-22 重订)**:`presenter` 在导航栈里 → **push**(隐藏系统导航栏、H5 画顶栏,
+  /// **系统侧滑返回保留**,✕ 仍在);没有导航栈 → 退回全屏 modal(✕ 是唯一出口)。
+  /// 为什么不再一律 modal:全屏 modal 在 iOS 上**没有任何退出手势**,客户进来后只能找右上角那个 ✕
+  /// —— owner iPhone 真机走查"退出来麻烦,租户会投诉"。安卓这一档是普通 Activity,系统返回手势
+  /// 天然可用;iOS 改 push 正好对齐(两端都是「H5 ✕ + 系统手势」两个出口)。
   ///
   /// 安卓对位:`HecongChatActivity.startImmersive(context, config)`。
   ///
@@ -314,6 +319,14 @@ public final class HecongChat: NSObject {
   {
     let vc = HecongChatViewController(config: config)
     vc.immersive = true
+    if let nav = (presenter as? UINavigationController) ?? presenter.navigationController {
+      // 与 push(from:config:) 同一套纪律:收起底部 Tab、不吃大标题(大标题在隐藏导航栏下也无意义)
+      vc.hidesBottomBarWhenPushed = true
+      if #available(iOS 11.0, *) { vc.navigationItem.largeTitleDisplayMode = .never }
+      vc.pushedImmersive = true // 让 VC 自己接管"隐藏导航栏 + 保活侧滑 + 离场还原"
+      nav.pushViewController(vc, animated: true)
+      return vc
+    }
     vc.modalPresentationStyle = .fullScreen // 沉浸 = 整页,不要卡片式半盖
     presenter.present(vc, animated: true)
     return vc
