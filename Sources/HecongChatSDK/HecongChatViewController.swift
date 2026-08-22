@@ -15,6 +15,15 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   private let idStore: HecongAnonymousIdStore
   private var webView: WKWebView?
   private var offlineView: UIView?
+  /// 承载形态(门面 `HecongChat.push/presentImmersive` 设;直接 new VC = 标准档)。
+  /// true = 沉浸档:整页交给 H5(渠道模板那条标题栏 + 右上 ✕),壳不画顶栏。
+  var immersive = false
+  /// 弹层档标记(门面 `presentSheet` 设)。顶栏由**系统导航栏**画,这里只用于形态判定。
+  var sheetMode = false
+  /// H5 顶栏是不是深底(capability `header-style`);nil = 还没收到,状态栏保持系统默认
+  private var headerIsDark: Bool?
+  /// 自绘顶栏 —— **只在标准档且宿主没有导航栏时**才有(有导航栏就是宿主那条,SDK 不画)
+  private var headerBar: HecongHeaderBar?
   /// 键盘布局所有权(壳缩 WebView 到键盘上方,细节见 HecongKeyboardLayoutGuard 头注释)
   private var keyboardGuard: HecongKeyboardLayoutGuard?
   /// H5 ready 前排队的命令(ready 后按序补发;页面重载会重新进入排队态)
@@ -38,29 +47,26 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     super.viewDidLoad()
     // 深色首帧不闪白:容器 + WebView 双层垫色跟当前解析出的档位(auto 用 systemBackground
     // 天然跟系统),骨架 body 同色三层兜齐,H5 接管后被页面背景覆盖
-    view.backgroundColor = config.colorScheme == "auto"
-      ? .systemBackground
-      : (resolvedColorScheme() == "dark"
-        ? backdropColor(HecongBridgeConstants.darkBackdrop) : .white)
+    // 深浅色:**声明给系统,不自己解析**(2026-08-20 重构,病根详 skeletonHtml 注释)。
+    //   · light/dark 档 → 用 overrideUserInterfaceStyle 告诉 UIKit,系统会把它传导给
+    //     本 VC、子视图、以及 **WKWebView 的 prefers-color-scheme**(骨架与 H5 一并对齐);
+    //   · host / auto 档 → 不 override,自然继承宿主 → 天然就是"跟随宿主 APP"。
+    // 底色一律用**系统动态色**:UIKit 在真正绘制那一刻按当时的 trait 求值,
+    // 不存在"读早了 / 读错源"的问题,也不必在 trait 变化时手动重刷。
+    if #available(iOS 13.0, *) {
+      switch config.colorScheme {
+      case "light": overrideUserInterfaceStyle = .light
+      case "dark": overrideUserInterfaceStyle = .dark
+      default: break
+      }
+    }
+    view.backgroundColor = .systemBackground
+    setupOwnHeaderIfNeeded()
     setupWebView()
     observeAppLifecycle()
     load()
     // 登记到门面 + 重放门面已登记的身份(租户可能在打开本页之前就 identify 过,§10.1)
     HecongChat.shared.attachTarget(self)
-  }
-
-  private func backdropColor(_ hex: String) -> UIColor {
-    var value: UInt64 = 0
-    Scanner(string: String(hex.dropFirst())).scanHexInt64(&value)
-    return UIColor(
-      red: CGFloat((value >> 16) & 0xFF) / 255, green: CGFloat((value >> 8) & 0xFF) / 255,
-      blue: CGFloat(value & 0xFF) / 255, alpha: 1)
-  }
-
-  /// 首帧垫色(骨架 body + WebView 透明层共用):按解析出的档位;auto 按当前系统深浅
-  private func resolvedBackdrop() -> String {
-    return resolvedColorScheme() == "dark"
-      ? HecongBridgeConstants.darkBackdrop : HecongBridgeConstants.lightBackdrop
   }
 
   /// 销毁:摘 message handler(WKUserContentController 强持有 handler,不摘 = 经典泄漏)
@@ -120,6 +126,56 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     send(["type": "setColorScheme", "payload": ["scheme": scheme]])
   }
 
+  // MARK: - 标题栏(标准档)
+
+  /// 标准档的顶栏归属(app-sdk-chat-entry.md §二):
+  ///   · 宿主有导航栏 → **就用他那条**(SDK 只在他没设 title 时帮忙填一个),零绘制;
+  ///   · 宿主没有导航栏 → SDK 自绘一条,补上"没顶栏也没出口"那个洞;
+  ///   · 沉浸档 → 一律不画,整页交给 H5。
+  private func setupOwnHeaderIfNeeded() {
+    guard !immersive else { return }
+    if navigationController?.isNavigationBarHidden == false {
+      // 宿主导航栏在场:标题他没设我们才填(宿主优先,不覆盖人家已有的)
+      if (title ?? "").isEmpty { title = config.resolveTitle() }
+      return
+    }
+    // 🔴 **被嵌进宿主页面时绝不画**(2026-08-20 owner 实拍"顶部两条标题栏"):
+    // `parent != nil` = 宿主把我们当**子页面**嵌进他自己的页面 —— 那正是「完全一致档」,
+    // 顶栏归他画,我们再画一条就是两条摞着。
+    // 前一版的判据是"没有导航栏就自己画",那是**靠形态猜意图**,子页面这一格恰好猜反。
+    // 现在只在**我们就是整屏的根**(模态呈现、无导航栏、无父级)时才画 —— 那时确实没有别人能画,
+    // 不画就等于没顶栏也没出口。
+    // (弹层档不走这里 —— 它由门面包一层系统导航栏,`isNavigationBarHidden == false` 上面已返回。)
+    guard parent == nil && presentingViewController != nil else { return }
+    let bar = HecongHeaderBar(config: config) { [weak self] in self?.goBack() }
+    bar.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(bar)
+    NSLayoutConstraint.activate([
+      bar.topAnchor.constraint(equalTo: view.topAnchor), // 标准档:背景铺进状态栏,内容落安全区内
+      bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      bar.bottomAnchor.constraint(
+        equalTo: view.safeAreaLayoutGuide.topAnchor, constant: HecongHeaderBar.contentHeight),
+    ])
+    headerBar = bar
+  }
+
+  /// 弹层档的关闭键(系统 `.close` bar button)—— 与自绘返回键同一条出口逻辑
+  @objc func closeFromChrome() { goBack() }
+
+  /// 返回:H5 里有可关的覆盖层就只关一层,否则退出本页(自绘顶栏的返回键走这条)
+  private func goBack() {
+    if webView?.canGoBack == true {
+      webView?.goBack() // → popstate → H5 NavStack 关栈顶层(与安卓 handleBackPressed 同构)
+      return
+    }
+    if presentingViewController != nil, navigationController?.viewControllers.count ?? 1 <= 1 {
+      dismiss(animated: true)
+    } else {
+      navigationController?.popViewController(animated: true)
+    }
+  }
+
   // MARK: - WebView 装配
 
   private func setupWebView() {
@@ -136,13 +192,24 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
         source: buildContextScript(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
     // 本地骨架页承载(装载形态 2026-08-17 改版,详 HecongLocalSchemeHandler 头注释)
     conf.setURLSchemeHandler(
-      HecongLocalSchemeHandler(loaderUrl: config.loaderUrl, background: resolvedBackdrop()),
+      HecongLocalSchemeHandler(loaderUrl: config.loaderUrl),
       forURLScheme: HecongBridgeConstants.localScheme)
     // H5 → 壳反向通知通道(weak proxy 断开 userContentController → handler → VC 的持有环)
     conf.userContentController.add(
       WeakScriptMessageHandler(self), name: HecongBridgeConstants.iosHandlerName)
 
     let wv = WKWebView(frame: view.bounds, configuration: conf)
+    // 🔴 **安全区让位只能有一个所有者 —— 这里选 H5**(2026-08-20 实测定位,owner 实拍"底部空一大块")。
+    //
+    // 病根:WKWebView 默认 `.automatic` 会**自己把安全区从可视区里扣掉**,而我们的页面是按
+    // `viewport-fit=cover` + `env(safe-area-inset-*)` **自己让位**设计的(顶栏吃上、输入区吃下)。
+    // 两套同时生效 = **双份补偿**:实测 WebView 852 高,而页面视口只剩 **759**(852-59-34,
+    // 正好是状态栏 + home 条),于是页面画到 759 就没了,**底部空出 93pt**。
+    // 与 `keyboard-and-viewport.md §一`「给键盘腾地方只能有一个所有者」完全同族 —— 安全区亦然。
+    //
+    // ⇒ 关掉系统那套:壳只负责把 WebView 摆在正确的矩形里,安全区一律由 H5 的 env() 吃。
+    // (Capacitor / Ionic 同款做法。)标准档也受益:那一档底部同样被多扣 34。
+    wv.scrollView.contentInsetAdjustmentBehavior = .never
     // WebView 首帧透明 → 透出容器垫色(WKWebView 默认不透明白底 = 深色闪白的来源)
     wv.isOpaque = false
     wv.backgroundColor = .clear
@@ -157,10 +224,31 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       hostView: view, webView: wv,
       topInset: { [weak self] in
         guard let self = self else { return 0 }
-        // 有原生导航栏 → 避开(状态栏 + 导航栏);无 → 铺满,状态栏由 H5 env 自理
-        return self.navigationController?.isNavigationBarHidden == false
-          ? self.view.safeAreaInsets.top : 0
+        // 顶边避让三种情况(键盘所有权同一个所有者管顶底,keyboard-and-viewport.md §一):
+        //   · 宿主导航栏在场 → 避开(状态栏 + 导航栏,VC view 延伸到栏下)
+        //   · SDK 自绘顶栏在场(标准档无宿主导航栏)→ 避开它的实际底边
+        //   · 都没有(沉浸档)→ 铺满,状态栏由 H5 的 env(safe-area-inset-top) 自理
+        if self.navigationController?.isNavigationBarHidden == false {
+          return self.view.safeAreaInsets.top
+        }
+        if self.headerBar != nil {
+          return self.view.safeAreaInsets.top + HecongHeaderBar.contentHeight
+        }
+        return 0
       })
+  }
+
+  /// 状态栏图标黑白 —— **沉浸档**才由我们决定(那时屏幕最顶是 H5 的标题栏,壳看不见它的颜色,
+  /// 靠桥通知 `header-style` 拿到明暗)。标准档顶栏是原生的、颜色我们自己知道,交给系统默认即可。
+  ///
+  /// ⚠️ 两个前置条件,踩了就不生效(要写进对外文档):
+  ///   ① 宿主 Info.plist 若把 `UIViewControllerBasedStatusBarAppearance` 设成 NO(老工程常见),
+  ///      本方法**整个失效**(那是"状态栏样式全局说了算"的开关);
+  ///   ② 非全屏 modal 需要 `modalPresentationCapturesStatusBarAppearance = true` 才轮得到我们
+  ///      —— 沉浸档用的是 .fullScreen,天然捕获,不必额外设。
+  public override var preferredStatusBarStyle: UIStatusBarStyle {
+    guard immersive, let dark = headerIsDark else { return .default }
+    return dark ? .lightContent : .darkContent // 深底配白图标,浅底配黑图标
   }
 
   public override func viewDidLayoutSubviews() {
@@ -172,6 +260,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   /// 未开未读跟踪的租户(默认档)这两行是空转,零开销。
   public override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
+
     HecongChat.shared.setChatVisible(true)
   }
 
@@ -317,8 +406,11 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       if let fb = routing.fallback { items.append(URLQueryItem(name: "fb", value: fb)) }
       if let fbg = routing.fallbackGroup { items.append(URLQueryItem(name: "fbg", value: fbg)) }
     }
+    // 标题栏归属:标准档 hh=1(H5 不画,顶栏归宿主导航栏或 SDK 自绘那条);
+    // 沉浸档 hh=0(H5 画自己那条彩色标题栏 + ✕ —— 那一档没有返回栈,✕ 是唯一出口)。
+    // 租户显式配过 hh/hideHeader 一律尊重,不覆盖。
     if !items.contains(where: { $0.name == "hh" || $0.name == "hideHeader" }) {
-      items.append(URLQueryItem(name: "hh", value: "1"))
+      items.append(URLQueryItem(name: "hh", value: immersive ? "0" : "1"))
     }
     parts.queryItems = items
     return parts.url!
@@ -338,6 +430,11 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     if let explicit = explicitScheme() { ctx["colorScheme"] = explicit }
     // 镜像优先于宿主 deviceId 种子:镜像 = 跟随 H5 真源的最新生效号,永远最准(§二.2)
     if let anon = idStore.read() ?? config.deviceId { ctx["anonymousId"] = anon }
+    // 宿主已登出 → 转达给 H5,让它先把设备上的会员痕迹清干净再启动(§二.4)。
+    // ⚠️ 与上面那行**同时**注入是刻意的:此刻镜像里还是旧号(要等 H5 回报新号才更新),
+    // 而 H5 侧的重置发生在读号之前 —— 重置完本地已有新号,种子按"仅本地为空时生效"
+    // 的既定规则自动落空。deviceId 那条兜底路同理被挡掉,不会把旧号顶回来。
+    if HecongChat.shared.pendingIdentityReset { ctx["identityReset"] = true }
     guard let data = try? JSONSerialization.data(withJSONObject: ctx),
       let json = String(data: data, encoding: .utf8)
     else { return "" }
@@ -358,9 +455,37 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     explicitScheme() ?? (hostIsDark() ? "dark" : "light")
   }
 
+  /// 宿主 APP 当前是不是深色 —— `host` 档的取值源。
+  ///
+  /// 🔴 **必须优先读宿主窗口的 trait,不能读自己的**(2026-08-20 owner 实拍两次抓到):
+  /// `viewDidLoad` 那一刻本 VC 常常**还没继承到窗口 trait**,读 `self.traitCollection`
+  /// 拿到的是**系统**深浅色。宿主用 `window.overrideUserInterfaceStyle` 强制浅色、
+  /// 而系统是深色时(很常见:App 内自带深色开关),就会解析成 dark,后果是:
+  ///   ① 容器垫色画成黑 → 顶栏/底部两条黑边;
+  ///   ② **骨架页首帧底色也画成黑 → 进页面先黑一下再跳成浅色**(owner:"闪一下")。
+  /// 而 `host` 档的语义本来就是"跟随**宿主 APP**",窗口 trait 才是那个真相。
+  ///
+  /// 取值顺序:窗口 → 父 VC(push 时是宿主导航栏)→ 呈现者(present 时)→ 自己(兜底)。
   private func hostIsDark() -> Bool {
-    if #available(iOS 13.0, *) { return traitCollection.userInterfaceStyle == .dark }
-    return false
+    guard #available(iOS 13.0, *) else { return false }
+    let source =
+      view.window?.traitCollection
+      ?? hostKeyWindow()?.traitCollection
+      ?? parent?.traitCollection
+      ?? presentingViewController?.traitCollection
+      ?? traitCollection
+    return source.userInterfaceStyle == .dark
+  }
+
+  /// 宿主的主窗口(拿它的 trait;App 级深浅色 override 就挂在窗口上)
+  private func hostKeyWindow() -> UIWindow? {
+    if #available(iOS 13.0, *) {
+      return UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .flatMap { $0.windows }
+        .first { $0.isKeyWindow }
+    }
+    return nil
   }
 
   /// 宿主深浅色变了 → 默认档(`host`)自动把新档位同步给聊天页,接入方零代码。
@@ -431,6 +556,8 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       }
       isBridgeReady = true
       cancelReadyWatchdog()
+      // 登出重置已被 H5 读到(ready 就是证据)→ 划掉待兑现标记 + 用新号恢复未读跟踪(§二.4)
+      HecongChat.shared.settleIdentityResetOnReady()
       let queued = pendingCommands
       pendingCommands = []
       queued.forEach { send($0) }
@@ -446,7 +573,20 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
         source: payload?["source"] as? String,
         pending: (payload?["pending"] as? Bool) ?? false)
       HecongChat.shared.applyHeaderIdentity(identity)
+      // 标准档开了 titleFollowsAgent:顶栏跟着接待身份换名字。
+      // pending 期不动(身份还在解析,动了会先闪一下空白);宿主导航栏那条同样跟。
+      if config.titleFollowsAgent, !identity.pending, let name = identity.nickname, !name.isEmpty {
+        headerBar?.setTitle(name)
+        if headerBar == nil, navigationController?.isNavigationBarHidden == false { title = name }
+      }
       notifyOwnDelegate { $0.hecongChatHeaderIdentityDidChange?(identity) }
+    case "header-style":
+      // H5 算好的"顶栏深不深"(布尔,不是颜色 —— 视觉决策留在 H5 侧,见 app-header-style.ts)
+      let dark = payload?["dark"] as? Bool
+      if headerIsDark != dark {
+        headerIsDark = dark
+        setNeedsStatusBarAppearanceUpdate()
+      }
     case "identified":
       if let userId = payload?["userId"] as? String { delegate?.hecongChatDidIdentify?(userId) }
     case "user-reset":
@@ -627,6 +767,9 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
 // MARK: - 导航回调
 
 extension HecongChatViewController: WKNavigationDelegate {
+  public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+  }
+
   /// 🔴 **非 http(s) 导航必须由壳转交系统**(2026-08-18 owner 真机式实测抓出)。
   ///
   /// 病根:消息里的电话号码/邮箱,H5 是用 `window.location.href = "tel:…"` 触发的

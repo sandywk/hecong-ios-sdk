@@ -74,6 +74,8 @@ public final class HecongChat: NSObject {
   }
 
   @objc public func startUnreadTracking() {
+    // 记下"租户要未读"这个意愿 —— 登出会暂停跟踪,拿到新号后据此自动恢复(见 settleIdentityResetOnReady)
+    cache.unreadTrackingWanted = true
     guard tracker == nil, let config = config else { return }
     // 闸门 ②:没聊过天的人不可能有未读 —— 零请求(§10.2)
     guard let anonymousId = HecongAnonymousIdStore(scope: config.anonymousIdScope).read(),
@@ -93,8 +95,17 @@ public final class HecongChat: NSObject {
     tracker.start()
   }
 
-  /// 停止未读跟踪(退出登录 / 租户自己的开关关掉时调)。
+  /// 停止未读跟踪(租户自己的开关关掉时调)。
+  ///
+  /// ⚠️ 与登出内部那次暂停不同:**这里是租户明确表示不要了**,所以连意愿一起清掉,
+  /// 不会被后续的"拿到新号自动恢复"复活。
   @objc public func stopUnreadTracking() {
+    cache.unreadTrackingWanted = false
+    suspendUnreadTracking()
+  }
+
+  /// 内部暂停(登出用):停轮询但**保留意愿**,拿到新号后自动恢复。
+  private func suspendUnreadTracking() {
     tracker?.stop()
     tracker = nil
   }
@@ -121,8 +132,27 @@ public final class HecongChat: NSObject {
 
   /// 退出登录:清身份 + 结束当前对话。**APP 登出时必须调** ——
   /// 不调的话下一个在同一台设备上登录的人会看到上一个人的聊天记录。
+  ///
+  /// **聊天页开着与否都生效**(2026-08-21,桥协议 §二.4)。租户在自己的设置页点退出时
+  /// 聊天页通常是关着的 —— 那一刻没有任何命令接收方,所以本方法**同时**做两件事:
+  ///   1. 开着 → 直接下发 `userReset`,H5 走完整链路(后端也会关掉旧对话)
+  ///   2. 无论开没开 → 记一笔待兑现,下次页面装载时经启动 context 转达给 H5
+  ///
+  /// 两条路重合时不会重复换号:H5 那边的判据是"本设备绑过会员没有",第 1 条走完之后
+  /// 绑定记录已清,第 2 条到达时会被自动忽略(幂等)。
+  ///
+  /// **壳这边不碰号、不删存储、也不发任何后端请求** —— 号的真源在 H5,壳只做镜像与传话
+  /// (`HecongAnonymousIdStore` 头注释)。壳自己动手会跟 H5 打架,而且后端那边反而更脏。
   @objc public func resetUser() {
     pendingIdentity.reset()
+    // 待兑现标记**无条件置位**,壳不做任何身份判断:
+    // "这台设备绑过会员没有"那份事实只有 H5 的本地存储知道,壳读不到也不该读一份副本
+    // (两份记同一件事、写入时机还不同 → 必然漂移)。纯匿名时 H5 会自动忽略。
+    cache.pendingIdentityReset = true
+    // 暂停未读:此刻壳手里还是旧号,继续轮询就是替**上一个人**拉未读数。
+    // 意愿保留,拿到新号后自动恢复(见 settleIdentityResetOnReady)。
+    suspendUnreadTracking()
+    applyUnread(0)
     forEachTarget { $0.resetUser() }
   }
 
@@ -133,6 +163,162 @@ public final class HecongChat: NSObject {
   /// 传 nil 清除。要细配降级策略用 `setRouting(_ routing:)` 那个重载。
   /// ⚠️ **只在"聊天页开着时要换组"或"启动前动态决定"才用它** —— 值固定的场景直接配
   /// `HecongChatConfig.routing` 更省事(走 URL 档,连桥都不用等)。
+  // MARK: - 打开聊天页(承载形态,app-sdk-chat-entry.md §二;与安卓 start/startImmersive 逐条对位)
+
+  /// **标准档**(绝大多数租户用这个):推进你自己的导航栏里 —— 顶栏就是你家那条,
+  /// 字体/返回箭头/配色/暗色全自动跟你的 APP 一致,SDK 一个像素都不画。
+  ///
+  /// 安卓对位:`HecongChatActivity.start(context, config)`。
+  ///
+  /// 标题:`config.title` 有值就填(你自己设过 `title` 则不覆盖);没传则「在线客服」。
+  ///
+  /// ```swift
+  /// HecongChat.shared.push(from: navigationController!, config: HecongChatConfig(channelId: "渠道ID"))
+  /// ```
+  @discardableResult
+  @objc(pushFrom:config:)
+  public func push(from navigationController: UINavigationController, config: HecongChatConfig)
+    -> HecongChatViewController
+  {
+    let vc = HecongChatViewController(config: config)
+    // 聊天是沉浸页:推入时收起宿主的底部 Tab。**设在这里而不是交给调用方** ——
+    // 靠调用方各自记得设,漏一处就是"聊天页底下压着一条 Tab 栏"(2026-08-19 真机实测到)
+    vc.hidesBottomBarWhenPushed = true
+    // 标题压成**一行紧凑**,不吃 iOS 大标题(2026-08-20 owner 实拍反馈"顶栏怎么这么高")。
+    // 理由:①聊天页几乎没有"大标题"诉求,那是列表页的语言;②大标题会随滚动收缩,而下面是
+    // WebView 自己的滚动,两套滚动不同步,收缩动画会一顿一顿。
+    // 租户想要大标题:push 之后自行 `vc.navigationItem.largeTitleDisplayMode = .always`。
+    if #available(iOS 11.0, *) { vc.navigationItem.largeTitleDisplayMode = .never }
+    navigationController.pushViewController(vc, animated: true)
+    return vc
+  }
+
+  /// **弹层档**:底部半屏卡片承载(默认 0.82 屏,`config.sheetHeightRatio` 可配),
+  /// 适合"聊一句就走、不离开当前页"的场景。**没有返回栈,✕ 是唯一出口**。
+  ///
+  /// 安卓对位:`HecongChatActivity.startSheet(context, config)`。
+  ///
+  /// 🔴 **手势优先级**:`prefersScrollingExpandsWhenScrolledToEdge = false` —— 让**聊天列表
+  /// 优先吃滚动手势**。不设的话系统规矩是「滚到顶再下拉 = 收起弹层」,而我们列表滚到顶的语义是
+  /// 「再往上翻更早的消息」,同一个手势两种语义会撞车(租户想翻记录,弹层被拉走)。
+  /// 拖拽交给抓手条/标题区,与安卓侧同一条原则(各用各的系统开关)。
+  ///
+  /// **降级(`.claude/rules/sdk-specific.md §0.5` 能用最新就用最新,老系统降级)**:
+  /// iOS 16+ 自定义比例;iOS 15 退系统半屏;**iOS 13/14 没有系统弹层 → 整档退成全屏 modal**
+  /// (✕ 仍在,功能不缺,只是形态退化)。
+  @discardableResult
+  @objc(presentSheetFrom:config:)
+  public func presentSheet(from presenter: UIViewController, config: HecongChatConfig)
+    -> HecongChatViewController
+  {
+    return presentSheet(from: presenter, config: config, useChannelHeader: false)
+  }
+
+  /// 弹层档 · 顶栏两选一(2026-08-20 owner 提)。
+  ///
+  /// - `useChannelHeader = false`(默认):**系统导航栏** —— 标题 + 系统关闭件,跟你 App 里
+  ///   其它弹层一个模子;配色可经 config 覆盖,还要更自由就拿返回的 vc 改 `navigationItem`。
+  /// - `useChannelHeader = true`:**卡片里整页交给聊天页** —— 顶上是渠道后台配的那条彩色标题栏
+  ///   (品牌感更强),右侧 ✕ 由它画,点了收起弹层。
+  ///
+  /// 本质上后者 = 「沉浸档装进弹层」,所以内部直接复用沉浸档那套(不新造形态,详实现)。
+  @discardableResult
+  @objc(presentSheetFrom:config:useChannelHeader:)
+  public func presentSheet(
+    from presenter: UIViewController, config: HecongChatConfig, useChannelHeader: Bool
+  ) -> HecongChatViewController {
+    let vc = HecongChatViewController(config: config)
+    vc.sheetMode = true
+    if useChannelHeader {
+      // 复用沉浸档语义:hh=0(H5 画自己那条)+ 壳不画顶栏 + ✕ 经 close capability 通知壳收起。
+      // 三件事一个标记全带上,不必再造一套并行分支。
+      vc.immersive = true
+      applySheetDetents(on: vc, config: config)
+      presenter.present(vc, animated: true)
+      return vc
+    }
+    // 🔴 **弹层顶条用系统导航栏,不自绘**(2026-08-20 owner 走查"手画的那条很粗糙")。
+    // iOS 对"弹层 + 标题 + 关闭"早有标准答案:内容包一层 UINavigationController,
+    // 标题走 `title`、关闭走系统 `.close` bar button(iOS 13+ 那个标准圆底 ✕)。
+    // 白捡的一堆细节:字号字重/左右间距/暗色适配/滚动时的边缘外观/安全区,全是系统给的,
+    // 而且**跟租户自家 App 里其它弹层长得一模一样** —— 自绘再精细也做不到这点。
+    let nav = UINavigationController(rootViewController: vc)
+    vc.navigationItem.rightBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .close, target: vc, action: #selector(HecongChatViewController.closeFromChrome))
+    if #available(iOS 11.0, *) { vc.navigationItem.largeTitleDisplayMode = .never }
+    // 配色项在这一档同样生效 —— 否则"改了 config 却没反应"(2026-08-20 owner 追问:
+    // "租户喜欢这个弹层但想改标题栏怎么办")。三级台阶与标准档一致:
+    //   零配置 = 系统样式 → config 配色 = 这里 → 还要更自由 = 拿返回的 vc 改 navigationItem
+    //   (titleView / 左右按钮 / tintColor 全在你手里,那是标准 UIKit,我们不拦)。
+    applySheetChrome(nav: nav, config: config)
+    applySheetDetents(on: nav, config: config)
+    presenter.present(nav, animated: true)
+    return vc
+  }
+
+  /// 弹层的高度档位与手势规则(两种顶栏形态共用)。
+  private func applySheetDetents(on presented: UIViewController, config: HecongChatConfig) {
+    guard #available(iOS 15.0, *), let sheet = presented.sheetPresentationController else {
+      presented.modalPresentationStyle = .fullScreen // iOS 13/14:无系统弹层,退全屏
+      return
+    }
+    sheet.prefersGrabberVisible = true
+    sheet.prefersScrollingExpandsWhenScrolledToEdge = false // 见上:聊天列表优先吃滚动
+    let ratio = max(0.3, min(1.0, config.sheetHeightRatio))
+    if #available(iOS 16.0, *) {
+      // 自定义比例 + 全屏两档 = "上拉全屏、下拉关闭"
+      let custom = UISheetPresentationController.Detent.custom { context in
+        context.maximumDetentValue * ratio
+      }
+      sheet.detents = [custom, .large()]
+    } else {
+      // iOS 15:只有系统写死的两档,比例配置在这一档失效(行为不坏)
+      sheet.detents = [.medium(), .large()]
+    }
+  }
+
+  /// 把 config 的标题栏配色应用到系统导航栏(弹层档)。
+  /// 不配则保持系统外观 —— **不配 ≠ 画成白色**,系统外观自带暗色适配与毛玻璃。
+  private func applySheetChrome(nav: UINavigationController, config: HecongChatConfig) {
+    guard config.headerBackgroundColor != nil || config.titleColor != nil else { return }
+    if #available(iOS 13.0, *) {
+      let appearance = UINavigationBarAppearance()
+      appearance.configureWithDefaultBackground()
+      if let bg = config.headerBackgroundColor {
+        appearance.configureWithOpaqueBackground() // 配了底色就别再叠毛玻璃,否则颜色不准
+        appearance.backgroundColor = bg
+      }
+      if let fg = config.titleColor {
+        appearance.titleTextAttributes = [.foregroundColor: fg]
+        nav.navigationBar.tintColor = fg // 关闭件跟着走,不然底色深了 ✕ 看不见
+      }
+      nav.navigationBar.standardAppearance = appearance
+      nav.navigationBar.scrollEdgeAppearance = appearance
+    } else {
+      config.headerBackgroundColor.map { nav.navigationBar.barTintColor = $0 }
+      config.titleColor.map { nav.navigationBar.tintColor = $0 }
+    }
+  }
+
+  /// **沉浸档**:整页交给 H5(渠道后台配的那条彩色标题栏 + 右上 ✕ 退出),适合想要整页品牌感的租户。
+  /// 这一档**没有返回栈,✕ 是唯一出口**,所以保留 ✕ —— 与标准档的"左上返回"刻意区分。
+  ///
+  /// 安卓对位:`HecongChatActivity.startImmersive(context, config)`。
+  ///
+  /// 📌 iOS 这一档天然完整:WebView 铺满到屏幕顶,H5 标题栏自己吃安全区,
+  /// **状态栏底色跟着 H5 顶栏走**,零配置(安卓侧要等刀 7 的 insets 专项才有,详 §5.1.1)。
+  @discardableResult
+  @objc(presentImmersiveFrom:config:)
+  public func presentImmersive(from presenter: UIViewController, config: HecongChatConfig)
+    -> HecongChatViewController
+  {
+    let vc = HecongChatViewController(config: config)
+    vc.immersive = true
+    vc.modalPresentationStyle = .fullScreen // 沉浸 = 整页,不要卡片式半盖
+    presenter.present(vc, animated: true)
+    return vc
+  }
+
   @objc public func setRouting(_ skillGroup: String?) {
     guard let skillGroup = skillGroup, !skillGroup.isEmpty else {
       setRouting(nil as HecongRouting?)
@@ -195,7 +381,21 @@ public final class HecongChat: NSObject {
   /// H5 侧新增命令后,不必等我们发原生包、也不必等你升级 SDK,自己拼 type + payload 就能调。
   /// H5 不认识的 type 会被安全丢弃(返回 unknown_command 并留痕),不会崩。
   @objc public func sendCommand(_ type: String, payload: [String: Any]?) {
+    // 聊天页没开 = 命令没有接收方 → **丢弃,但留痕**。
+    //
+    // 刻意**不缓冲**:壳不知道这条命令是什么语义,猜着缓冲可能更糟 —— 比如"打开选择器"
+    // 被攒住,半小时后页面一开突然弹出来,那是 bug 不是特性。将来真有需要跨页面存活的
+    // 新命令,那时把它提升成具名方法(具名方法才有资格决定自己的重放语义,如
+    // identify 的合并容器 / registerAction 的全量表)。
+    //
+    // 有留痕才排查得动:此前是**静默丢弃**,租户只会看到"我调了怎么没反应"。
     guard !type.isEmpty else { return }
+    if !hasLiveTarget {
+      HecongErrorReporter.shared.report(
+        scope: "bridge", message: "command '\(type)' dropped: no chat view mounted",
+        channelId: config?.channelId)
+      return
+    }
     forEachTarget { $0.sendCommand(type, payload: payload) }
   }
 
@@ -222,10 +422,32 @@ public final class HecongChat: NSObject {
     targets.remove(target)
   }
 
+  /// 当前有没有活着的聊天视图(命令有没有接收方)
+  private var hasLiveTarget: Bool {
+    targets.allObjects.contains { $0 is HecongChatCommandTarget }
+  }
+
   private func forEachTarget(_ block: (HecongChatCommandTarget) -> Void) {
     for case let t as HecongChatCommandTarget in targets.allObjects { block(t) }
   }
 
+
+  /// 视图装载时要不要转达"宿主已登出"(桥协议 §二.4)。
+  ///
+  /// 壳只传话:纯匿名时 H5 会自己忽略(判据"绑过会员没有"那份事实只有它的本地存储知道)。
+  var pendingIdentityReset: Bool { cache.pendingIdentityReset }
+
+  /// 桥 ready → 结算待兑现的登出重置。
+  ///
+  /// **必须等 ready,不能注入时就划掉** —— 页面可能压根没起来(断网 / 静态域不可达),
+  /// 那时划掉等于把这次登出永久丢了。ready 到了才说明 H5 真的读到了那个启动参数。
+  ///
+  /// 顺带恢复未读:登出时暂停了轮询(那时手里还是旧号),此刻 H5 已回报新号、镜像也更新过,
+  /// 用新号接着跟踪才是对的。租户显式 stop 过则不恢复(那是"不要了",意愿已清)。
+  func settleIdentityResetOnReady() {
+    if cache.pendingIdentityReset { cache.pendingIdentityReset = false }
+    if cache.unreadTrackingWanted && tracker == nil { startUnreadTracking() }
+  }
 
   /// 视图 ready 时把 H5 下发的 apiBase 缓存下来,供**下次启动**的未读跟踪用
   func cacheApiBase(_ apiBase: String) {
@@ -270,9 +492,31 @@ public final class HecongChat: NSObject {
 /// 这里只是 H5 下发值的本地副本(§10.2)。
 final class HecongRuntimeCache {
   private let key = "hecong.chat.apiBase"
+  private let resetKey = "hecong.chat.pendingIdentityReset"
+  private let unreadWishKey = "hecong.chat.unreadTrackingWanted"
 
   var apiBase: String? {
     get { UserDefaults.standard.string(forKey: key) }
     set { UserDefaults.standard.set(newValue, forKey: key) }
+  }
+
+  /// 待兑现的登出重置(桥协议 §二.4)。
+  ///
+  /// **必须落盘,不能只放内存** —— 租户点完退出登录,他自己的登录态就清了;APP 被杀掉之后
+  /// 他**不会再调一次**(没什么可退的了)。这一笔丢了就是永远丢了,而它防的正是
+  /// 「下一个人在这台设备上看到上一个人的记录」。反过来 identify 不需要落盘:租户的登录态
+  /// 本身是持久的,APP 重启恢复登录态时会再告诉我们一遍。
+  ///
+  /// 只是个布尔,不含会员 ID / 资料,不碰隐私清单(§10.3)。
+  var pendingIdentityReset: Bool {
+    get { UserDefaults.standard.bool(forKey: resetKey) }
+    set { UserDefaults.standard.set(newValue, forKey: resetKey) }
+  }
+
+  /// 租户是否开过未读跟踪(登出会暂停它,拿到新号后据此自动恢复)。
+  /// 不记的话租户得自己记着重新开一次 —— 他不会知道,未读就静默没了。
+  var unreadTrackingWanted: Bool {
+    get { UserDefaults.standard.bool(forKey: unreadWishKey) }
+    set { UserDefaults.standard.set(newValue, forKey: unreadWishKey) }
   }
 }

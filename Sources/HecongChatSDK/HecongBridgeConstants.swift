@@ -9,7 +9,7 @@ import Foundation
 
 enum HecongBridgeConstants {
   /// 壳包版本(context.shellVersion,诊断/灰度用;发版时更新)
-  static let shellVersion = "0.2.0"
+  static let shellVersion = "0.3.0"
 
   /// document-start 注入的 context 全局 key(桥协议 §二)
   static let contextKey = "__hecongAppContext"
@@ -28,8 +28,11 @@ enum HecongBridgeConstants {
   /// 'close':H5 标题栏画关闭键 → notify('close') → 壳退出(hh=1 无标题栏时 H5 天然不画)
   /// 'session-events':H5 把会话事件(消息到达/对话起止/网络)装进统一 `event` 信封发来,
   /// 壳转给宿主的通吃回调 + 常用具名回调。加新事件只动 H5 清单,壳零改动。
+  /// 'header-style':H5 告诉壳"当前顶栏是深底还是浅底"→ 壳切状态栏图标黑白。
+  /// 只在沉浸档有意义(标准档顶栏是原生的,壳自己知道颜色)。app-sdk-chat-entry.md §5.2
   static let capabilities = [
     "permission-gate", "badge", "download", "open-url", "close", "header", "session-events",
+    "header-style",
   ]
 
   /// 桥协议 context 结构版本
@@ -77,16 +80,34 @@ enum HecongBridgeConstants {
   /// viewport-fit=cover 必带 —— H5 顶部安全区 env() 方案靠它才取到真值。
   /// 骨架本地承载永不失败,断网失败的是**插座 script** → onerror 经既有通知通道报壳
   /// (loader-error),壳画兜底页 + 重试(重载骨架即重拉插座)。
-  /// 深色首帧垫色 = H5 深色窗体底真值(theme-tokens-dark cGray0)。仅垫 H5 接管前的首帧,
-  /// 之后页面自身背景覆盖 —— 治"深色模式下打开闪白"
+  /// 骨架页首帧垫色 —— **深色值只出现在这里的 CSS 里,壳不再在原生侧解析深浅色**
+  /// (2026-08-20 重构,详 skeletonHtml)。深色取 H5 深色窗体底真值(theme-tokens-dark cGray0)。
   static let darkBackdrop = "#0d1117"
   static let lightBackdrop = "#ffffff"
 
-  static func skeletonHtml(loaderUrl: String, background: String) -> String {
-    """
+  /// 骨架 HTML。
+  ///
+  /// 🔴 **底色由 CSS 媒体查询自己决定,不接受外部传入**(2026-08-20 重构,owner 两次实拍逼出来的)。
+  ///
+  /// 病根:原先壳在原生侧把"当前是深是浅"解析成固定色值再烘进这段 HTML。于是同一个问题
+  /// 被拆成**三处各猜一次**(容器底色 / 骨架底色 / H5 自己),任何一处**判早了**(VC 还没继承到
+  /// 宿主窗口 trait)或**判错源**(读了系统而非宿主 App)就会割裂:
+  ///   · 顶栏与底部安全区两条黑边(容器猜深、页面画浅);
+  ///   · **进页面先黑一下再跳浅色**(骨架猜深、H5 画浅)。
+  /// 前两次修都是"让某一处猜得更准" —— 猜得再准也还是猜。
+  ///
+  /// 正解:**不解析**。CSS 的 `prefers-color-scheme` 由 WebView 在**真正绘制那一刻**求值,
+  /// 且天然继承宿主的深浅色(含 App 用 `overrideUserInterfaceStyle` 强制的那种)——
+  /// 与容器用的系统动态色 `.systemBackground` 同源,**结构上不可能不一致,也没有时机问题**。
+  static func skeletonHtml(loaderUrl: String) -> String {
+    return """
     <!doctype html><html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>Chat</title><style>html,body{margin:0;height:100%;background:\(background)}</style></head>
+    <title>Chat</title><style>
+    :root{color-scheme:light dark}
+    html,body{margin:0;height:100%;background:\(lightBackdrop)}
+    @media (prefers-color-scheme: dark){html,body{background:\(darkBackdrop)}}
+    </style></head>
     <body><script src="\(loaderUrl)" onerror="webkit.messageHandlers.\(iosHandlerName).postMessage({type:'loader-error'})"></script></body></html>
     """
   }

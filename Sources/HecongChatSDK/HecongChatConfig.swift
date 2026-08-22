@@ -4,6 +4,7 @@
 // 所以这里是 NSObject 子类 + @objc 协议 + 字符串档位,不用 Swift-only struct / 枚举关联值。
 
 import Foundation
+import UIKit
 
 /// 壳式 app-sdk 配置。国内合规注意(app-sdk-plan.md §7.3 延迟初始化):
 /// 本类只是参数容器,零活动;网络/存储访问从 `HecongChatViewController` 装载才开始,
@@ -41,6 +42,36 @@ public final class HecongChatConfig: NSObject {
   /// 只有 `auto` 零注入(web-sdk-theming.md §7.3.1)。
   @objc public var colorScheme: String = "host"
 
+  /// 标题栏文字(标准档 / 弹层档的原生标题栏用)。**不传 = 「在线客服」**
+  /// (按系统语言中英两档,不引 i18n 包 —— 同插座 `link-notice` 先例)。
+  ///
+  /// ⚠️ 刻意**不做**"跟随客服昵称"为默认:昵称会跳变(进来是渠道身份 → 客服接待变客服名 →
+  /// 转接再变一次),顶栏文字这么跳观感差,且身份解析中那一小会儿是空的。
+  /// 要跟随请显式开 ``titleFollowsAgent``。
+  ///
+  /// 📌 被 push 进宿主自己的 `UINavigationController` 时,本值会填到 `self.title`
+  /// (宿主已经自己设过 title 则不覆盖 —— 宿主优先)。
+  @objc public var title: String?
+
+  /// 标题栏是否跟随当前接待身份(客服昵称)。默认 false,理由见 ``title``。
+  @objc public var titleFollowsAgent: Bool = false
+
+  /// 弹层档(`presentSheet`)的初始高度占屏比。默认 0.82;**上拉全屏 / 下拉关闭**。
+  ///
+  /// ⚠️ **iOS 15 降级**:系统弹层在 15 上只有"半屏/全屏"两档写死的,自定义比例要 **iOS 16+**
+  /// (custom detent)—— 15 上本值退成系统半屏,行为不坏。iOS 13/14 没有系统弹层,整档退成全屏 modal。
+  @objc public var sheetHeightRatio: CGFloat = 0.82
+
+  /// 标题栏底色(nil = 跟随系统 `systemBackground`,深浅色自动适配)
+  @objc public var headerBackgroundColor: UIColor?
+
+  /// 标题栏文字与返回箭头颜色(nil = 跟随系统 `label`)
+  @objc public var titleColor: UIColor?
+
+  /// 返回箭头图标(nil = 用系统 SF Symbol `chevron.left`)。
+  /// ⚠️ 传进来的图标**不染色**(多半已是自家配色)。
+  @objc public var backImage: UIImage?
+
   /// 宿主稳定标识(可选,app-sdk-plan.md §六"设备指纹"档):仅作镜像的**首次种子**;
   /// 已有镜像/H5 已有身份时不会顶掉既有号(桥协议 §二.2 播种规则,这是特性不是缺陷)。
   @objc public var deviceId: String?
@@ -56,6 +87,30 @@ public final class HecongChatConfig: NSObject {
   /// 未读轮询间隔(秒;仅 `HecongChat.startUnreadTracking()` 显式开启后生效)。
   /// 下限 30s,内部强制(防配出高频请求)。未读能力**默认关闭**,详 app-sdk-plan.md §10.2。
   @objc public var unreadPollInterval: TimeInterval = 60
+
+  // MARK: - 原生标题栏文案(中英两档,不引 i18n 包)
+
+  /// 标题栏该显示什么:租户传了用租户的,否则按语言给默认值。
+  ///
+  /// 语言判据:优先 `extraQuery["lang"]`(与 H5 同一个参数,两边不会各说各话),否则跟系统语言。
+  /// **只有中英两档** —— 壳不引 i18n 包(同插座 5KB 纪律),其它语言落英文;要精确文案直接传 ``title``。
+  func resolveTitle() -> String {
+    if let t = title, !t.trimmingCharacters(in: .whitespaces).isEmpty { return t }
+    return isChinese() ? "在线客服" : "Customer service"
+  }
+
+  /// 返回键的无障碍朗读文本(VoiceOver 要读得出)
+  func resolveBackLabel() -> String { isChinese() ? "返回" : "Back" }
+
+  /// 弹层档 ✕ 的无障碍朗读文本(语义是"关闭"不是"返回",别混用)
+  func resolveCloseLabel() -> String { isChinese() ? "关闭" : "Close" }
+
+  private func isChinese() -> Bool {
+    if let explicit = extraQuery["lang"], !explicit.isEmpty {
+      return explicit.lowercased().hasPrefix("zh")
+    }
+    return (Locale.preferredLanguages.first ?? "").lowercased().hasPrefix("zh")
+  }
 
   @objc public init(channelId: String) {
     self.channelId = channelId

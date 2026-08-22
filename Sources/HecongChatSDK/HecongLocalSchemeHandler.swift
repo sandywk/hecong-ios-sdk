@@ -13,10 +13,8 @@ import WebKit
 
 final class HecongLocalSchemeHandler: NSObject, WKURLSchemeHandler {
   private let loaderUrl: String
-  private let background: String
-  init(loaderUrl: String, background: String) {
+  init(loaderUrl: String) {
     self.loaderUrl = loaderUrl
-    self.background = background
   }
 
   func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
@@ -24,7 +22,7 @@ final class HecongLocalSchemeHandler: NSObject, WKURLSchemeHandler {
     // 唯一资源就是骨架页(插座/chunk/资产全走线上域,不经本 handler);
     // 其余路径(如内核探测)也回骨架,幂等无害
     let data = Data(
-      HecongBridgeConstants.skeletonHtml(loaderUrl: loaderUrl, background: background).utf8)
+      HecongBridgeConstants.skeletonHtml(loaderUrl: loaderUrl).utf8)
     let response = URLResponse(
       url: url, mimeType: "text/html", expectedContentLength: data.count, textEncodingName: "utf-8")
     task.didReceive(response)
