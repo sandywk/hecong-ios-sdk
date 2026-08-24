@@ -26,8 +26,16 @@ final class HecongSwipeBackKeeper: NSObject, UIGestureRecognizerDelegate {
   func install() -> Bool {
     guard !installed, let nav = navigationController, let pop = nav.interactivePopGestureRecognizer
     else { return installed }
-    // delegate 不是导航控制器本身 = 宿主自己在管(或别人已接管),不抢
-    guard pop.delegate == nil || pop.delegate === nav else { return false }
+    // 「delegate 还是系统默认」的判据(2026-08-24 owner 真机:沉浸/嵌入档侧滑仍无效,二修):
+    // UIKit 给这个手势装的默认 delegate 是私有的 _UINavigationInteractiveTransition 对象,
+    // **不是** UINavigationController 本身 —— 旧判据 `=== nav` 永远不成立,keeper 从未装上过。
+    // 公开 API 的正确判法:delegate 的类来自 UIKit 框架 bundle = 系统默认,可接管;
+    // 来自宿主 App(或第三方库)= 宿主自管,不抢。
+    if let current = pop.delegate, current !== nav {
+      guard let cls = object_getClass(current),
+        Bundle(for: cls) == Bundle(for: UINavigationController.self)
+      else { return false }
+    }
     originalDelegate = pop.delegate
     pop.delegate = self
     installed = true

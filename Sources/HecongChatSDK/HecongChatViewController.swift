@@ -34,8 +34,12 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   private var headerIsDark: Bool?
   /// 自绘顶栏 —— **只在标准档且宿主没有导航栏时**才有(有导航栏就是宿主那条,SDK 不画)
   private var headerBar: HecongHeaderBar?
-  /// 键盘布局所有权(壳缩 WebView 到键盘上方,细节见 HecongKeyboardLayoutGuard 头注释)
+  /// 键盘布局所有权(双路:H5 认 keyboard-inset → 壳逐帧报数;老 H5 → 缩 WebView 兜底,
+  /// 细节见 HecongKeyboardLayoutGuard 头注释)
   private var keyboardGuard: HecongKeyboardLayoutGuard?
+  /// H5 是否认 `--hc-app-kb-bottom`(ready 载荷 capabilities 含 'keyboard-inset',桥协议 §四;
+  /// 与安卓 HecongChatView.h5KeyboardInset 同一条握手)。页面重载回到 false 等下一次 ready。
+  private var h5KeyboardInset = false
   /// H5 ready 前排队的命令(ready 后按序补发;页面重载会重新进入排队态)
   private var isBridgeReady = false
   /// 上次同步给聊天页的深浅色档位,避免同一档位重复下发
@@ -250,6 +254,15 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
           return self.view.safeAreaInsets.top + HecongHeaderBar.contentHeight
         }
         return 0
+      },
+      h5OwnsKeyboard: { [weak self] in self?.h5KeyboardInset ?? false },
+      injectKeyboardInsets: { [weak wv] kbPx, insetPx in
+        // 与安卓 HecongChatView.injectCssInsets 同一对变量名(pt = CSS px,无需换算);
+        // 顶部不注入 —— iOS 的 env(safe-area-inset-top) 一直可靠,H5 兜底链自然生效
+        wv?.evaluateJavaScript(
+          "document.documentElement.style.setProperty('--hc-app-kb-bottom','\(kbPx)px');"
+            + "document.documentElement.style.setProperty('--hc-app-inset-bottom','\(insetPx)px');",
+          completionHandler: nil)
       })
   }
 
@@ -607,6 +620,10 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       if let apiBase = payload?["apiBase"] as? String, !apiBase.isEmpty {
         HecongChat.shared.cacheApiBase(apiBase)
       }
+      // H5 能力声明(桥协议 §四):认不认键盘遮挡变量,决定键盘让位由谁做(见 h5KeyboardInset)
+      h5KeyboardInset =
+        (payload?["capabilities"] as? [Any])?.contains { ($0 as? String) == "keyboard-inset" } ?? false
+      keyboardGuard?.modeDidChange() // 老 H5 缩过的 frame → 新 H5 要满高,重铺一次
       isBridgeReady = true
       cancelReadyWatchdog()
       // 登出重置已被 H5 读到(ready 就是证据)→ 划掉待兑现标记 + 用新号恢复未读跟踪(§二.4)
@@ -876,8 +893,12 @@ extension HecongChatViewController: WKNavigationDelegate {
   public func webView(
     _ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!
   ) {
-    // 页面(重)加载 → 桥重建前回到排队态,期间命令积压等下一次 ready
+    // 页面(重)加载 → 桥重建前回到排队态,期间命令积压等下一次 ready;
+    // 键盘握手随文档一起作废(CSS 变量在旧文档上,注入去重基线也要清)
     isBridgeReady = false
+    h5KeyboardInset = false
+    keyboardGuard?.pageDidReset()
+    keyboardGuard?.modeDidChange()
   }
 
   /// WebContent 进程被系统回收(内存吃紧时 iOS 会直接杀掉 WebView 的渲染进程)。
