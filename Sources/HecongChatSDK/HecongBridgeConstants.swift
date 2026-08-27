@@ -9,7 +9,7 @@ import Foundation
 
 enum HecongBridgeConstants {
   /// 壳包版本(context.shellVersion,诊断/灰度用;发版时更新)
-  static let shellVersion = "0.3.4"
+  static let shellVersion = "0.3.5"
 
   /// document-start 注入的 context 全局 key(桥协议 §二)
   static let contextKey = "__hecongAppContext"
@@ -76,6 +76,19 @@ enum HecongBridgeConstants {
   /// 品牌值同本文件其余常量:迁移日与 H5 env 注入一起换。
   static let defaultLoaderUrl = "https://assets.aihecong.com/sdk/hecong-link.js"
 
+  /// 后端 API 域,**仅用于骨架页的 `<link rel=preconnect>` 提前握手**(2026-08-27 首屏体验专项)。
+  ///
+  /// 为什么壳这边要单独写一份(H5 侧构建期已烘了 `LINK_API_BASE`):进站第一跳 config 就打这个域,
+  /// 而插座是**远程 script** —— 等它下载执行完再插 preconnect,下一行就发 config 了,**零提前量**。
+  /// 只有写在骨架 HTML 的 `<head>` 里,才能让「建连」跟「拉插座」并行跑掉。
+  /// (对话链接落地页不吃这条:那边插座是内联的,插座里那份 preconnect 就够 ——
+  /// 详 `link-loader-entry.ts` 的 `preconnect` 注释。)
+  ///
+  /// ⚠️ 这是一份**刻意接受的副本**,判据是「漂了会怎样」:preconnect 纯属提示,
+  /// 域名过期/写错只是浪费一次空连接,**功能一个字节都不受影响**(与底色那种漂了就视觉穿帮的
+  /// 性质完全不同,别套用那条墓碑)。品牌值迁移日与 [defaultLoaderUrl] 等常量一起换。
+  static let defaultApiOrigin = "https://sdkapi.aihecong.com"
+
   /// 骨架 HTML(壳生成,免打包静态资源;loaderUrl 可被 config 覆盖供本地联调)。
   /// viewport-fit=cover 必带 —— H5 顶部安全区 env() 方案靠它才取到真值。
   /// 骨架本地承载永不失败,断网失败的是**插座 script** → onerror 经既有通知通道报壳
@@ -103,7 +116,9 @@ enum HecongBridgeConstants {
     return """
     <!doctype html><html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>Chat</title><style>
+    <title>Chat</title>
+    <link rel="preconnect" href="\(defaultApiOrigin)" crossorigin>
+    <style>
     :root{color-scheme:light dark}
     html,body{margin:0;height:100%;background:\(lightBackdrop)}
     @media (prefers-color-scheme: dark){html,body{background:\(darkBackdrop)}}
@@ -111,4 +126,71 @@ enum HecongBridgeConstants {
     <body><script src="\(loaderUrl)" onerror="webkit.messageHandlers.\(iosHandlerName).postMessage({type:'loader-error'})"></script></body></html>
     """
   }
+
+  /// 预下载清单的文件名 —— 与 TS 侧 `shared-utils/src/prewarm-manifest-path.ts` 的
+  /// `PREWARM_MANIFEST` **必须逐字一致**(跨语言契约只能靠纪律,同本文件其余桥常量)。
+  static let prewarmManifestName = "prewarm.json"
+
+  /// 预下载页 HTML(壳生成,只在**隐藏 WebView** 里跑)—— 2026-08-27 首屏体验专项。
+  ///
+  /// ## 它做什么 / 刻意不做什么
+  ///
+  /// **只下载,不执行。** 页面里没有一行业务 JS:先读渠道配置拿到当前 SDK 版本,再读版本目录里的
+  /// 预下载清单,然后把首屏那几个文件 `fetch` 一遍 —— 让它们进 WebView 的 HTTP 缓存,**仅此而已**。
+  /// 下载完的 JS **不会被当成脚本执行**(没有任何 `<script src>` 指向它们)。
+  ///
+  /// ## 🔴 为什么必须"只下载不执行"(整个方案的命门,别为"预热得更彻底"往里加执行)
+  ///
+  /// 一旦执行了聊天窗的 JS,就会连锁触发:领票 → 建 WS → 老访客走 `session.resume`,
+  /// 而 resume 路径会让**后端把访客标成在线**。2026-08-27 与 api 仓会话交叉核实:
+  /// 服务端 session 在 Redis 里 TTL **30 分钟**,「APP 被杀后 30 分钟内重启」正好命中 ⇒
+  /// 工作台会闪一次假的"访客上线",而这恰恰是最常见的重启间隔(不是长尾)。
+  /// 断开时又因 `onClose → onLeft` 按"人"定位,可能把该用户**另一条真实连接**误伤成离线。
+  /// ⇒ 不执行 = 不领票 = 不连 WS = 上面这些一条都碰不到,同时白屏里最大的一块(下载)照样省掉。
+  /// (后端侧结论读的是当时工作区状态,微信客服渠道专项提交后建议复核。)
+  ///
+  /// ## 收益边界 —— 它只治"第一次"
+  ///
+  /// WebView 的 HTTP 缓存**跨 APP 重启保留**(实测:杀掉 APP 重启后取同一文件 3ms / 传输 0 字节;
+  /// 版本目录是 immutable 一年)。所以本页只在**两种时刻**有价值:①用户第一次用;②我们发新版后
+  /// 第一次用。老用户日常打开时文件本就在缓存里 —— 那一段归「备用页保活」治,不归它。
+  ///
+  /// ## 失败无害
+  ///
+  /// 配置读不到 / 清单没有 / 版本对不上 / 网络断 → 就是没预下载成,照旧走正常加载流程。
+  /// 不崩、不报错、不产生脏数据。故全程 `catch` 后静默,不上报(它不是故障,是"这次没赶上")。
+  static func prewarmHtml(apiOrigin: String, cdnOrigin: String, channelId: String) -> String {
+    return """
+    <!doctype html><html><head><meta charset="utf-8"><title>p</title></head><body><script>
+    (async () => {
+      try {
+        const cfgRes = await fetch('\(apiOrigin)/sdk/config/\(channelId)');
+        if (!cfgRes.ok) return;
+        const cfg = await cfgRes.json();
+        const v = cfg && cfg.sdk && cfg.sdk.version;
+        if (!v) return;
+        // 显式判状态:清单不存在时对象存储回的是 XML 错误页,直接 .json() 会抛 ——
+        // 虽然外层 catch 兜得住,但"靠解析失败来发现 404"不是意图明确的写法
+        const mRes = await fetch('\(cdnOrigin)/sdk/v/' + v + '/\(prewarmManifestName)');
+        if (!mRes.ok) return;
+        const m = await mRes.json();
+        // 清单里的 files 是**相对版本目录**的(清单自己就躺在那个目录下,版本号我们已经有了);
+        // loader 是固定路径,相对 CDN 根。两者拼法不同,别混。
+        const urls = [m.loader].concat((m.files || []).map((f) => 'sdk/v/' + v + '/' + f));
+        // 并发拉:它们互不依赖,而且只是灌缓存,谁先谁后无所谓
+        await Promise.all(urls.filter(Boolean).map((u) => fetch('\(cdnOrigin)/' + u).catch(() => {})));
+      } catch (e) {
+        // 失败无害:没预下载成而已,照旧走正常加载
+      }
+    })();
+    </script></body></html>
+    """
+  }
+
+  // 🔴 **进站占位转圈不在这里** —— 它由壳原生绘制,见 `HecongBootWaitView`。
+  //
+  // 曾经在这里写过一份纯 CSS 转圈(照官方对话链接落地页的做法),浏览器里验证完全正常,
+  // **装进 APP 一帧都看不到**:WKWebView 在插座到货前根本不绘制任何内容(连满屏红块都不显示),
+  // 骨架 HTML 里放什么都是白写。完整诊断过程记在 `HecongBootWaitView` 头注释,
+  // **别再把占位挪回骨架 HTML**。
 }

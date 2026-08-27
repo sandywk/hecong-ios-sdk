@@ -15,6 +15,8 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   private let idStore: HecongAnonymousIdStore
   private var webView: WKWebView?
   private var offlineView: UIView?
+  /// 进站占位转圈(原生画;**不能写在骨架 HTML 里**,病因见 `HecongBootWaitView` 头注释)
+  private let bootWait = HecongBootWaitView()
   /// 承载形态(门面 `HecongChat.push/presentImmersive` 设;直接 new VC = 标准档)。
   /// true = 沉浸档:整页交给 H5(渠道模板那条标题栏 + 右上 ✕),壳不画顶栏。
   var immersive = false
@@ -88,6 +90,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   @objc public func destroy() {
     HecongChat.shared.detachTarget(self)
     cancelReadyWatchdog()
+    bootWait.detach() // 连同它的两个延时任务一起清(code-style §5:timer 必须在销毁路径 clear)
     guard let wv = webView else { return }
     wv.evaluateJavaScript(
       "window.\(HecongBridgeConstants.bridgeKey)&&window.\(HecongBridgeConstants.bridgeKey).destroy()",
@@ -333,6 +336,50 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   public override func viewDidDisappear(_ animated: Bool) {
     super.viewDidDisappear(animated)
     HecongChat.shared.setChatVisible(false)
+    // 真正退出(pop 出栈 / 被 dismiss)→ 交给备用页池保活,下次打开直接端出来。
+    // ⚠️ 只在**确实离开**时入池:被别的页盖住(push 了下一页)也会走 viewDidDisappear,
+    // 那时人还在这条栈里、随时会回来,入池会把活页当成备用页停掉在线状态。
+    if isMovingFromParent || isBeingDismissed {
+      HecongChatPool.shared.put(self, config: config)
+    }
+  }
+
+  // MARK: - 备用页池挂起/恢复(HecongChatPool)
+
+  /// 能不能留作备用页。
+  ///
+  /// 两个条件缺一不可:
+  /// ① **出过错的不留** —— 端出来是一片空白 / 兜底页,比重新加载更糟;
+  /// ② 🔴 **只有标准档能留**(2026-08-27 审查抓出):弹层档(系统半屏卡片)与沉浸档各自带着
+  ///    呈现态,而门面**只在 `push` 那一档去池子里取** —— 入池却不分档的话,弹层档用完进了池,
+  ///    下次标准档打开就把它端出来了,布局与顶栏全错。取放两侧必须同口径。
+  var isPoolable: Bool {
+    offlineView == nil && isBridgeReady && webView != nil
+      && !sheetMode && !immersive && !pushedImmersive
+  }
+
+  /// 当前正躺在备用页池里(= 没人在看)。
+  ///
+  /// 存这个标记是为了一条**很容易漏掉的边界**:躺在池里时渲染进程若被系统回收
+  /// (`webViewWebContentProcessDidTerminate` → 自动 `load()` 重来),桥会**重建**,
+  /// 而新桥并不知道"其实没人在看" —— 不补一句 background,H5 会以为自己回到前台,
+  /// 后端就又把这个访客算成在线了(在线状态错 + 离线推送不触发)。
+  private var isSuspendedInPool = false
+
+  /// 入池:人已经离开聊天页,但 WebView 还活着。
+  ///
+  /// 🔴 **必须喊 background** —— 否则后端一直认为访客在线(心跳是 WS 层无条件自动应答,
+  /// **不代表有人在看屏幕**,病理同 `app-bridge-commands.ts` 的 appLifecycle 注释):
+  /// 客服端看到的在线状态是错的,离线推送 webhook 也永不触发。复用现成命令,零新增协议。
+  func poolWillSuspend() {
+    isSuspendedInPool = true
+    send(lifecycleCommand("background"))
+  }
+
+  /// 端出池:人回来了,把在线状态喊回去。
+  func poolDidResume() {
+    isSuspendedInPool = false
+    send(lifecycleCommand("foreground"))
   }
 
   // MARK: - APP 前后台联动(桥协议 §六)
@@ -369,6 +416,12 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
 
   @objc private func hostWillEnterForeground() {
     guard webView != nil else { return }
+    // 🔴 **躺在备用页池里时绝不喊 foreground**(2026-08-27 审查抓出)。
+    // 场景:用户聊完退出(入池 → 已喊 background,后端知道人走了)→ 把 APP 切后台 → 再切回前台。
+    // 此刻本 VC 还活着、通知照收,喊一句 foreground 就会让 H5 复连 WS、后端把访客算成在线 ——
+    // **而用户根本没打开聊天页**。假在线从这条路溜进来,比入池那次更隐蔽(它不在打开/关闭路径上)。
+    // 真正回前台的时机由 `poolDidResume()` 负责(端出池那一刻),不是 APP 切回来那一刻。
+    guard !isSuspendedInPool else { return }
     send(lifecycleCommand("foreground"))
   }
 
@@ -416,6 +469,10 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     offlineView = nil
     isBridgeReady = false
     startReadyWatchdog()
+    // 占位转圈跟着每一次 load 走(含兜底页的"重试"):这段等待每次都存在,不只首次进场。
+    // ⚠️ 挂在 **VC 的 view** 上,不是挂进 WebView —— 往 WKWebView 里 addSubview 会被它自己的
+    // 内容层盖住(实测一帧都看不到);当兄弟视图叠在上面才画得出来。
+    bootWait.attach(to: view)
     webView?.load(URLRequest(url: skeletonPageUrl()))
   }
 
@@ -626,6 +683,10 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       keyboardGuard?.modeDidChange() // 老 H5 缩过的 frame → 新 H5 要满高,重铺一次
       isBridgeReady = true
       cancelReadyWatchdog()
+      bootWait.detach() // 真实画面已就位,占位让位(桥 ready 是壳能拿到的最早"H5 活了"的信号)
+      // 躺在备用页池里期间重建的桥(预热首次 ready / 渲染进程被回收后重载)并不知道没人在看,
+      // 必须补一句 —— 否则后端把这个访客算成在线(见 isSuspendedInPool 注释)
+      if isSuspendedInPool { send(lifecycleCommand("background")) }
       // 登出重置已被 H5 读到(ready 就是证据)→ 划掉待兑现标记 + 用新号恢复未读跟踪(§二.4)
       HecongChat.shared.settleIdentityResetOnReady()
       let queued = pendingCommands
@@ -800,6 +861,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   private func showOfflineView(reason: String = "load failed") {
     // 只报一次(offlineView 已在 = 同一次失败的重复回调),同时透给宿主自行上报/换 UI
     guard offlineView == nil else { return }
+    bootWait.detach() // 已判定失败 → 别在兜底页后面继续转(转圈=还有希望,兜底页=没戏了,两者互斥)
     HecongErrorReporter.shared.report(
       scope: "load", message: reason, channelId: config.channelId)
     delegate?.hecongChatDidFailToLoad?(reason)

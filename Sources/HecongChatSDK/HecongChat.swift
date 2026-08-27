@@ -149,11 +149,48 @@ public final class HecongChat: NSObject {
     // "这台设备绑过会员没有"那份事实只有 H5 的本地存储知道,壳读不到也不该读一份副本
     // (两份记同一件事、写入时机还不同 → 必然漂移)。纯匿名时 H5 会自动忽略。
     cache.pendingIdentityReset = true
+    // 🔴 换人 → 备用页立刻作废。池子里那个装着**上一个人的会话**,留着就是把他的聊天记录
+    // 端给下一个人(§10.3.1 同款血泪:换人不换号)。判据刻意粗,理由见 dropForIdentityChange。
+    HecongChatPool.shared.dropForIdentityChange()
     // 暂停未读:此刻壳手里还是旧号,继续轮询就是替**上一个人**拉未读数。
     // 意愿保留,拿到新号后自动恢复(见 settleIdentityResetOnReady)。
     suspendUnreadTracking()
     applyUnread(0)
     forEachTarget { $0.resetUser() }
+  }
+
+  // MARK: - 备用聊天页(预热 / 保活,HecongChatPool)
+
+  /// 门面当前登记的会员 ID(nil = 匿名)。备用页签名要用它判"是不是同一个人"。
+  /// **这是壳自己发出去过的值**,不是去读 H5 里那份真源(读副本必然漂移,见 resetUser 注释)。
+  var currentUserId: String? { pendingIdentity.userId }
+
+  /// 提前把聊天页准备好,用户点开时**秒开**。
+  ///
+  /// ## 🔴 什么时候调 —— 必须在「用户已同意隐私政策」之后
+  ///
+  /// 本方法**会联网、会写本地存储**(它就是真的把整条链跑一遍)。
+  /// 国内应用商店(华为/小米尤严)审核的第一杀手就是「用户同意隐私政策前第三方 SDK 就联网」,
+  /// 出事是**租户被拒审/下架**。所以它刻意**没有**塞进 `configure()` ——
+  /// 那个方法被设计成零活动、允许在 App 启动时就调(见其注释),两者语义完全不同,别合并。
+  /// 同款先例:`startUnreadTracking()` 也是"显式 opt-in + 闸门",不是自动开。
+  ///
+  /// ## 不调也不亏
+  ///
+  /// **保活是默认开的、全自动的** —— 用户用过一次聊天页之后,退出时会自动留作备用页,
+  /// 5 分钟内再进就是秒开。本方法只是把这份收益**提前到第一次打开**。
+  /// 租户一行不写也能拿到"第二次进很快",调了才多拿"第一次也很快"。
+  ///
+  /// ## 安全性
+  ///
+  /// 预热出来的 WebView **不挂进任何视图树**,结构上不可能在租户界面里露脸(实测见
+  /// `HecongChatPool` 头注释)。换人/换渠道/内存告警/渲染进程被杀/超时五道闸门全自动生效,
+  /// **租户不需要记得调用任何清理方法**。
+  ///
+  /// 重复调用幂等(已有备用页则忽略)。
+  @objc public func prewarm() {
+    guard let config = config else { return } // 没 configure 过 → 零活动
+    HecongChatPool.shared.prewarm(config: config)
   }
 
   // MARK: - 会话指派(app-sdk-plan.md §10.7 / sdk-agent-routing.md)
@@ -180,7 +217,12 @@ public final class HecongChat: NSObject {
   public func push(from navigationController: UINavigationController, config: HecongChatConfig)
     -> HecongChatViewController
   {
-    let vc = HecongChatViewController(config: config)
+    // 备用页命中 = 秒开(整条链不用重跑);拿不到就照旧新建。
+    // 只有**标准档**走池子:弹层/沉浸档各自带着呈现态(detent、导航栏接管),复用要多守一堆
+    // 状态,收益却一样 —— 先只做最常用这一档,稳了再说(§0 稳定第一)。
+    let vc = HecongChatPool.shared.take(config: config) ?? HecongChatViewController(config: config)
+    // 复用时把纯壳侧 UI 项覆盖一遍(它们不进池子签名,见 HecongChatPool.signature)
+    if vc.title == nil || vc.title?.isEmpty == true { vc.title = config.resolveTitle() }
     // 聊天是沉浸页:推入时收起宿主的底部 Tab。**设在这里而不是交给调用方** ——
     // 靠调用方各自记得设,漏一处就是"聊天页底下压着一条 Tab 栏"(2026-08-19 真机实测到)
     vc.hidesBottomBarWhenPushed = true
