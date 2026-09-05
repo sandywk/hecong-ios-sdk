@@ -112,39 +112,18 @@ public final class HecongChat: NSObject {
 
   // MARK: - 身份(§10.1:不打开聊天页也能绑定)
 
-  /// 绑定已登录会员。**可在聊天页打开之前调**(如 APP 登录成功那一刻)——
-  /// 身份会被记住,聊天页起来时自动补发,不需要租户自己挑时机。
+  /// 绑定已登录会员 + 写资料。**传什么覆盖什么**(PATCH:传了的字段覆盖,没传的不动),
+  /// **任何时机可调**:登录时、资料变了(APP 版本号一类)、换了会员,都调它,它是唯一的资料写入口
+  /// (2026-09-05 起 `updateUser` 已删,不留兼容)。
   ///
-  /// 已经开着聊天页时立即生效。多个聊天页同时开着时每个都会收到。
+  /// **可在聊天页打开之前调**(如 APP 登录成功那一刻)—— 身份会被记住(同一个人多次调用逐字段
+  /// 合并),聊天页起来时自动补发一次,不需要租户自己挑时机。已经开着聊天页时立即生效。
   @objc public func identify(
     userId: String, profile: [String: Any]? = nil, data: [String: Any]? = nil
   ) {
     guard !userId.isEmpty else { return }
     pendingIdentity.identify(userId: userId, profile: profile, data: data)
     forEachTarget { $0.identify(userId: userId, profile: profile, data: data) }
-  }
-
-  /// 更新会员资料(PATCH:没传的字段不动;后端**强覆盖**,跟 identify 的"空才补"不同 ——
-  /// APP 版本号这类会变的字段要走这个)。同样可在聊天页打开之前调。
-  @objc public func updateUser(profile: [String: Any]? = nil, data: [String: Any]? = nil) {
-    pendingIdentity.update(profile: profile, data: data)
-    forEachTarget { sendUserUpdate(to: $0, profile: profile, data: data) }
-  }
-
-  /// 下发 userUpdate,**能带 userId 就带上**。H5 桥对命令不排队,identify 与紧随其后的 userUpdate
-  /// 会并发处理;userUpdate 不带 userId 时要靠 identify 先落地才知道是谁,并发下就可能"还不知道是谁"
-  /// 而被丢掉。带上 userId 后两条各自独立成立,先后到达都对(后端 update 路径自带绑定)。
-  private func sendUserUpdate(
-    to target: HecongChatCommandTarget, profile: [String: Any]?, data: [String: Any]?
-  ) {
-    guard let userId = pendingIdentity.userId else {
-      target.updateUser(profile: profile, data: data)
-      return
-    }
-    var payload: [String: Any] = ["userId": userId]
-    if let profile = profile { payload["profile"] = profile }
-    if let data = data { payload["data"] = data }
-    target.sendCommand("userUpdate", payload: payload)
   }
 
   /// 退出登录:清身份 + 结束当前对话。**APP 登出时必须调** ——
@@ -531,20 +510,11 @@ public final class HecongChat: NSObject {
     // 那时按钮和指派组照样要生效,所以壳状态重放不能挂在身份的 guard 后面
     pendingShell.replay(into: target)
     guard let userId = pendingIdentity.userId else { return }
-    // 🔴 两段重放,对应后端两种覆盖语义(HecongPendingIdentity 头注释):
-    //   1. identify 只带 identify 原话(空才补,不碰客服手改过的档案)
-    //   2. userUpdate 只带被 update 过的字段(强覆盖,会变的字段这样才刷得新)
-    // 揉成一条 identify 发 = 把租户的 updateUser 偷换成 identify,版本号永远停在第一次的值。
+    // 重放一条合并后的 identify(同一个人多次调用已逐字段合并,详 HecongPendingIdentity 头注释)
     target.identify(
       userId: userId,
       profile: pendingIdentity.profile.isEmpty ? nil : pendingIdentity.profile,
       data: pendingIdentity.data.isEmpty ? nil : pendingIdentity.data)
-    if pendingIdentity.hasUpdates {
-      sendUserUpdate(
-        to: target,
-        profile: pendingIdentity.updatedProfile.isEmpty ? nil : pendingIdentity.updatedProfile,
-        data: pendingIdentity.updatedData.isEmpty ? nil : pendingIdentity.updatedData)
-    }
   }
 
   /// 聊天视图卸载 → 摘登记(弱表本身也会自动清,显式摘是为了立刻停止转发)
@@ -603,18 +573,20 @@ public final class HecongChat: NSObject {
   func applyUnread(_ count: Int) {
     guard unreadCount != count else { return }
     unreadCount = count
-    delegate?.hecongChatUnreadDidChange?(count)
+    // delegate 协议是 @MainActor;门面本身没标(ObjC / Swift 5 老工程零负担),调用点已在主线程
+    // (未读轮询回调已 hop 回主线程、桥消息在主线程),这里只是把这个事实告诉编译器
+    MainActor.assumeIsolated { delegate?.hecongChatUnreadDidChange?(count) }
   }
 
   /// 标题栏身份变化(聊天视图收到桥通知后喂进来)
   func applyHeaderIdentity(_ identity: HecongHeaderIdentity) {
     headerIdentity = identity
-    delegate?.hecongChatHeaderIdentityDidChange?(identity)
+    MainActor.assumeIsolated { delegate?.hecongChatHeaderIdentityDidChange?(identity) }
   }
 
   /// 生效匿名号变化 → 透给宿主(推送闭环:租户据此建 anonymousId ↔ pushToken 映射,§10.5)
   func notifyAnonymousIdChanged(_ anonymousId: String) {
-    delegate?.hecongChatDidChangeAnonymousId?(anonymousId)
+    MainActor.assumeIsolated { delegate?.hecongChatDidChangeAnonymousId?(anonymousId) }
   }
 }
 

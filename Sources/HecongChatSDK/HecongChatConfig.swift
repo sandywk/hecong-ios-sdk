@@ -152,6 +152,14 @@ public final class HecongRouting: NSObject {
 }
 
 /// 壳 → 宿主 APP 的事件回调(全部可选;不实现即走壳内默认行为)。
+///
+/// 标 `@MainActor`(2026-09-05,客服 APP Swift 6 接入实锤):所有回调本来就在主线程投递
+/// (桥消息 / WebView 导航回调 / 未读轮询都已 hop 回主线程),声明出来宿主用 `@MainActor` 类实现时
+/// 才不会在 Swift 6 语言模式下报「conformance crosses into main actor-isolated code」
+/// (Xcode 26 新建工程默认 Swift 6,不标的话这是每个新租户看到的第一条警告)。
+/// 与 UIKit 自家 delegate(`UITableViewDelegate` 等)同款写法。
+/// **对老工程零影响**:Swift 5 语言模式下不产生任何诊断;ObjC 看不到 actor 标注,照常实现。
+@MainActor
 @objc(HecongChatDelegate)
 public protocol HecongChatDelegate: AnyObject {
   /// H5 装配完成,身份命令已可发(在此之前调 identify 会自动排队,ready 后补发)

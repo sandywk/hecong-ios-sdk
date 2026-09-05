@@ -123,13 +123,6 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     send(["type": "identify", "payload": payload])
   }
 
-  @objc public func updateUser(profile: [String: Any]?, data: [String: Any]?) {
-    var payload: [String: Any] = [:]
-    if let profile = profile { payload["profile"] = profile }
-    if let data = data { payload["data"] = data }
-    send(["type": "userUpdate", "payload": payload])
-  }
-
   @objc public func resetUser() {
     send(["type": "userReset"])
   }

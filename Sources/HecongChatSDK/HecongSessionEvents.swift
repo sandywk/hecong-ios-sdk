@@ -23,6 +23,7 @@ enum HecongSessionEvents {
   /// - Parameters:
   ///   - payload: 桥通知 payload,形如 `{ name: "message:incoming", data?: {...} }`
   ///   - notify: 把一个回调动作施加到"该收的每个 delegate"上(视图侧负责与门面去重)
+  @MainActor
   static func dispatch(
     _ payload: [String: Any]?, notify: ((HecongChatDelegate) -> Void) -> Void
   ) {
