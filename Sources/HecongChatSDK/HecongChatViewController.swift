@@ -262,9 +262,13 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       injectKeyboardInsets: { [weak wv] kbPx, insetPx in
         // 与安卓 HecongChatView.injectCssInsets 同一对变量名(pt = CSS px,无需换算);
         // 顶部不注入 —— iOS 的 env(safe-area-inset-top) 一直可靠,H5 兜底链自然生效
+        // 判空不能省:注入时机不由壳控制,页面就绪前 `document.documentElement` 是 null,
+        // 直接写会抛 TypeError(安卓侧线上实测偶发)。注入式 JS 没有脚本 URL,报错算在
+        // 文档头上、且早于 H5 错误捕获挂载 —— 监控里查不到,只能在源头防住。
         wv?.evaluateJavaScript(
-          "document.documentElement.style.setProperty('--hc-app-kb-bottom','\(kbPx)px');"
-            + "document.documentElement.style.setProperty('--hc-app-inset-bottom','\(insetPx)px');",
+          "var d=document.documentElement;if(d){"
+            + "d.style.setProperty('--hc-app-kb-bottom','\(kbPx)px');"
+            + "d.style.setProperty('--hc-app-inset-bottom','\(insetPx)px');}",
           completionHandler: nil)
       })
   }

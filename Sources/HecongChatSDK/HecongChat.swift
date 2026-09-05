@@ -124,10 +124,27 @@ public final class HecongChat: NSObject {
     forEachTarget { $0.identify(userId: userId, profile: profile, data: data) }
   }
 
-  /// 更新会员资料(PATCH:没传的字段不动)。同样可在聊天页打开之前调。
+  /// 更新会员资料(PATCH:没传的字段不动;后端**强覆盖**,跟 identify 的"空才补"不同 ——
+  /// APP 版本号这类会变的字段要走这个)。同样可在聊天页打开之前调。
   @objc public func updateUser(profile: [String: Any]? = nil, data: [String: Any]? = nil) {
     pendingIdentity.update(profile: profile, data: data)
-    forEachTarget { $0.updateUser(profile: profile, data: data) }
+    forEachTarget { sendUserUpdate(to: $0, profile: profile, data: data) }
+  }
+
+  /// 下发 userUpdate,**能带 userId 就带上**。H5 桥对命令不排队,identify 与紧随其后的 userUpdate
+  /// 会并发处理;userUpdate 不带 userId 时要靠 identify 先落地才知道是谁,并发下就可能"还不知道是谁"
+  /// 而被丢掉。带上 userId 后两条各自独立成立,先后到达都对(后端 update 路径自带绑定)。
+  private func sendUserUpdate(
+    to target: HecongChatCommandTarget, profile: [String: Any]?, data: [String: Any]?
+  ) {
+    guard let userId = pendingIdentity.userId else {
+      target.updateUser(profile: profile, data: data)
+      return
+    }
+    var payload: [String: Any] = ["userId": userId]
+    if let profile = profile { payload["profile"] = profile }
+    if let data = data { payload["data"] = data }
+    target.sendCommand("userUpdate", payload: payload)
   }
 
   /// 退出登录:清身份 + 结束当前对话。**APP 登出时必须调** ——
@@ -201,20 +218,48 @@ public final class HecongChat: NSObject {
   /// ⚠️ **只在"聊天页开着时要换组"或"启动前动态决定"才用它** —— 值固定的场景直接配
   /// `HecongChatConfig.routing` 更省事(走 URL 档,连桥都不用等)。
   // MARK: - 打开聊天页(承载形态,app-sdk-chat-entry.md §二;与安卓 start/startImmersive 逐条对位)
+  //
+  // 🔴 **三档都不要租户传 presenter**(2026-09-05 owner 定,零包袱一步到位):SDK 经
+  // `HecongPresenterResolver` 自己找前台最上层控制器。理由:SwiftUI 工程按钮回调里没有 self,
+  // 租户得自己写十几行"找顶层控制器";安卓传 context 哪都有,两端本就不对等;Intercom / Zendesk 的
+  // `present()` 一律不要 presenter。想精确控制从哪弹的,走第③档自己拿 `HecongChatViewController` 摆放。
+  // 返回 nil 只有一种情况:前台没有任何窗口(APP 还没起窗口就调 / 纯后台),此时什么都不做、不 crash。
+  // ObjC 名字显式给(app-sdk-chat-entry.md §七之二 互操作坑 4)。
 
-  /// **标准档**(绝大多数租户用这个):推进你自己的导航栏里 —— 顶栏就是你家那条,
+  /// **标准档**(绝大多数租户用这个):推进你当前页面所在的导航栏里 —— 顶栏就是你家那条,
   /// 字体/返回箭头/配色/暗色全自动跟你的 APP 一致,SDK 一个像素都不画。
+  ///
+  /// **没有导航栈**(纯 modal 层 / SwiftUI 无 NavigationStack)→ 退化成全屏弹页,
+  /// 顶上包一条系统导航栏 + 右上 ✕(标题与配色项照旧生效),功能一样不缺。
   ///
   /// 安卓对位:`HecongChatActivity.start(context, config)`。
   ///
-  /// 标题:`config.title` 有值就填(你自己设过 `title` 则不覆盖);没传则「在线客服」。
+  /// 标题:`config.title` 有值就填;没传则「在线客服」。
   ///
   /// ```swift
-  /// HecongChat.shared.push(from: navigationController!, config: HecongChatConfig(channelId: "渠道ID"))
+  /// HecongChat.shared.push(config: HecongChatConfig(channelId: "渠道ID"))
   /// ```
   @discardableResult
-  @objc(pushFrom:config:)
-  public func push(from navigationController: UINavigationController, config: HecongChatConfig)
+  @objc(pushWithConfig:)
+  public func push(config: HecongChatConfig) -> HecongChatViewController? {
+    guard let top = HecongPresenterResolver.topViewController() else { return nil }
+    if let nav = (top as? UINavigationController) ?? top.navigationController {
+      return pushInto(nav, config: config)
+    }
+    let vc = HecongChatViewController(config: config)
+    if vc.title == nil || vc.title?.isEmpty == true { vc.title = config.resolveTitle() }
+    let nav = UINavigationController(rootViewController: vc)
+    vc.navigationItem.rightBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .close, target: vc, action: #selector(HecongChatViewController.closeFromChrome))
+    if #available(iOS 11.0, *) { vc.navigationItem.largeTitleDisplayMode = .never }
+    applySheetChrome(nav: nav, config: config)
+    nav.modalPresentationStyle = .fullScreen
+    top.present(nav, animated: true)
+    return vc
+  }
+
+  /// 标准档实现:推进指定导航栈。
+  private func pushInto(_ navigationController: UINavigationController, config: HecongChatConfig)
     -> HecongChatViewController
   {
     // 备用页命中 = 秒开(整条链不用重跑);拿不到就照旧新建。
@@ -248,12 +293,14 @@ public final class HecongChat: NSObject {
   /// **降级(`.claude/rules/sdk-specific.md §0.5` 能用最新就用最新,老系统降级)**:
   /// iOS 16+ 自定义比例;iOS 15 退系统半屏;**iOS 13/14 没有系统弹层 → 整档退成全屏 modal**
   /// (✕ 仍在,功能不缺,只是形态退化)。
+  ///
+  /// ```swift
+  /// HecongChat.shared.presentSheet(config: config)
+  /// ```
   @discardableResult
-  @objc(presentSheetFrom:config:)
-  public func presentSheet(from presenter: UIViewController, config: HecongChatConfig)
-    -> HecongChatViewController
-  {
-    return presentSheet(from: presenter, config: config, useChannelHeader: false)
+  @objc(presentSheetWithConfig:)
+  public func presentSheet(config: HecongChatConfig) -> HecongChatViewController? {
+    return presentSheet(config: config, useChannelHeader: false)
   }
 
   /// 弹层档 · 顶栏两选一(2026-08-20 owner 提)。
@@ -265,9 +312,17 @@ public final class HecongChat: NSObject {
   ///
   /// 本质上后者 = 「沉浸档装进弹层」,所以内部直接复用沉浸档那套(不新造形态,详实现)。
   @discardableResult
-  @objc(presentSheetFrom:config:useChannelHeader:)
-  public func presentSheet(
-    from presenter: UIViewController, config: HecongChatConfig, useChannelHeader: Bool
+  @objc(presentSheetWithConfig:useChannelHeader:)
+  public func presentSheet(config: HecongChatConfig, useChannelHeader: Bool)
+    -> HecongChatViewController?
+  {
+    guard let top = HecongPresenterResolver.topViewController() else { return nil }
+    return presentSheet(on: top, config: config, useChannelHeader: useChannelHeader)
+  }
+
+  /// 弹层档实现:从指定控制器弹出。
+  private func presentSheet(
+    on presenter: UIViewController, config: HecongChatConfig, useChannelHeader: Bool
   ) -> HecongChatViewController {
     let vc = HecongChatViewController(config: config)
     vc.sheetMode = true
@@ -344,7 +399,7 @@ public final class HecongChat: NSObject {
 
   /// **沉浸档**:整页交给 H5(渠道后台配的那条彩色标题栏 + 右上 ✕ 退出),适合想要整页品牌感的租户。
   ///
-  /// **呈现方式(2026-08-22 重订)**:`presenter` 在导航栈里 → **push**(隐藏系统导航栏、H5 画顶栏,
+  /// **呈现方式(2026-08-22 重订)**:当前页面在导航栈里 → **push**(隐藏系统导航栏、H5 画顶栏,
   /// **系统侧滑返回保留**,✕ 仍在);没有导航栈 → 退回全屏 modal(✕ 是唯一出口)。
   /// 为什么不再一律 modal:全屏 modal 在 iOS 上**没有任何退出手势**,客户进来后只能找右上角那个 ✕
   /// —— owner iPhone 真机走查"退出来麻烦,租户会投诉"。安卓这一档是普通 Activity,系统返回手势
@@ -354,15 +409,25 @@ public final class HecongChat: NSObject {
   ///
   /// 📌 iOS 这一档天然完整:WebView 铺满到屏幕顶,H5 标题栏自己吃安全区,
   /// **状态栏底色跟着 H5 顶栏走**,零配置(安卓侧要等刀 7 的 insets 专项才有,详 §5.1.1)。
+  ///
+  /// ```swift
+  /// HecongChat.shared.presentImmersive(config: config)
+  /// ```
   @discardableResult
-  @objc(presentImmersiveFrom:config:)
-  public func presentImmersive(from presenter: UIViewController, config: HecongChatConfig)
+  @objc(presentImmersiveWithConfig:)
+  public func presentImmersive(config: HecongChatConfig) -> HecongChatViewController? {
+    guard let top = HecongPresenterResolver.topViewController() else { return nil }
+    return presentImmersive(on: top, config: config)
+  }
+
+  /// 沉浸档实现:从指定控制器进入。
+  private func presentImmersive(on presenter: UIViewController, config: HecongChatConfig)
     -> HecongChatViewController
   {
     let vc = HecongChatViewController(config: config)
     vc.immersive = true
     if let nav = (presenter as? UINavigationController) ?? presenter.navigationController {
-      // 与 push(from:config:) 同一套纪律:收起底部 Tab、不吃大标题(大标题在隐藏导航栏下也无意义)
+      // 与 pushInto 同一套纪律:收起底部 Tab、不吃大标题(大标题在隐藏导航栏下也无意义)
       vc.hidesBottomBarWhenPushed = true
       if #available(iOS 11.0, *) { vc.navigationItem.largeTitleDisplayMode = .never }
       vc.pushedImmersive = true // 让 VC 自己接管"隐藏导航栏 + 保活侧滑 + 离场还原"
@@ -466,10 +531,20 @@ public final class HecongChat: NSObject {
     // 那时按钮和指派组照样要生效,所以壳状态重放不能挂在身份的 guard 后面
     pendingShell.replay(into: target)
     guard let userId = pendingIdentity.userId else { return }
+    // 🔴 两段重放,对应后端两种覆盖语义(HecongPendingIdentity 头注释):
+    //   1. identify 只带 identify 原话(空才补,不碰客服手改过的档案)
+    //   2. userUpdate 只带被 update 过的字段(强覆盖,会变的字段这样才刷得新)
+    // 揉成一条 identify 发 = 把租户的 updateUser 偷换成 identify,版本号永远停在第一次的值。
     target.identify(
       userId: userId,
       profile: pendingIdentity.profile.isEmpty ? nil : pendingIdentity.profile,
       data: pendingIdentity.data.isEmpty ? nil : pendingIdentity.data)
+    if pendingIdentity.hasUpdates {
+      sendUserUpdate(
+        to: target,
+        profile: pendingIdentity.updatedProfile.isEmpty ? nil : pendingIdentity.updatedProfile,
+        data: pendingIdentity.updatedData.isEmpty ? nil : pendingIdentity.updatedData)
+    }
   }
 
   /// 聊天视图卸载 → 摘登记(弱表本身也会自动清,显式摘是为了立刻停止转发)

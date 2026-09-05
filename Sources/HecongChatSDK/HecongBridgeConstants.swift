@@ -9,7 +9,7 @@ import Foundation
 
 enum HecongBridgeConstants {
   /// 壳包版本(context.shellVersion,诊断/灰度用;发版时更新)
-  static let shellVersion = "0.3.5"
+  static let shellVersion = "0.4.0"
 
   /// document-start 注入的 context 全局 key(桥协议 §二)
   static let contextKey = "__hecongAppContext"
