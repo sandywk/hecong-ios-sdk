@@ -702,7 +702,9 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       let queued = pendingCommands
       pendingCommands = []
       queued.forEach { send($0) }
-      delegate?.hecongChatReady?()
+      // 通知型 ⇒ 两级扇出(同 identified 那批,2026-09-06 一并补齐:此前只走视图 delegate,
+      // 只用门面的租户收不到 ready)
+      notifyFacadeAndOwn { $0.hecongChatReady?() }
     case "anonymousIdChanged":
       if let anon = payload?["anonymousId"] as? String, !anon.isEmpty { adoptAnonymousId(anon) }
     case "header-identity":
@@ -729,17 +731,19 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
         setNeedsStatusBarAppearanceUpdate()
       }
     case "identified":
-      if let userId = payload?["userId"] as? String { delegate?.hecongChatDidIdentify?(userId) }
+      if let userId = payload?["userId"] as? String {
+        notifyFacadeAndOwn { $0.hecongChatDidIdentify?(userId) }
+      }
       // 后端白名单丢弃的自定义字段名 —— **默认就打警告**,不依赖租户实现回调:
       // 这类问题的表现是"资料静默不生效",不主动喊一嗓子,租户只能去工作台逐字段核对。
       // (网页端一直是 console.warn;iOS 侧此前连 H5 console 都不转发 = 完全看不见。)
       let ignored = HecongIgnoredKeys.parse(payload)
       if !ignored.isEmpty {
         print("[HecongChat] 以下自定义字段未在工作台「自定义字段」中定义,已被忽略:\(ignored.joined(separator: ", "))")
-        delegate?.hecongChatDidIgnoreCustomFields?(ignored)
+        notifyFacadeAndOwn { $0.hecongChatDidIgnoreCustomFields?(ignored) }
       }
     case "user-reset":
-      delegate?.hecongChatDidResetUser?()
+      notifyFacadeAndOwn { $0.hecongChatDidResetUser?() }
     case "unread":
       // 聊天页开着时 WS 是权威来源 → 同步喂门面(轮询此刻是暂停的,不会打架,§10.2)
       if let count = payload?["count"] as? Int {
@@ -759,16 +763,12 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       }
     case "event":
       // 会话事件信封(capability 'session-events'):具名回调 + 通吃,详 HecongSessionEvents
-      HecongSessionEvents.dispatch(payload) { action in
-        if let facade = HecongChat.shared.delegate { action(facade) }
-        notifyOwnDelegate(action) // 与门面同一对象时跳过,避免同一件事回调两次
-      }
+      HecongSessionEvents.dispatch(payload) { action in notifyFacadeAndOwn(action) }
     case "action-click":
       // 壳注册的自定义按钮被点(桥协议 §四)。门面与视图两处 delegate 都报,notifyOwnDelegate
       // 负责去重(租户常把同一个对象两边都设,不去重会把商品面板开两次)
       if let id = payload?["id"] as? String, !id.isEmpty {
-        HecongChat.shared.delegate?.hecongChat?(didClickAction: id)
-        notifyOwnDelegate { $0.hecongChat?(didClickAction: id) }
+        notifyFacadeAndOwn { $0.hecongChat?(didClickAction: id) }
       }
     case "loader-error":
       // 骨架里插座 script 拉取失败(断网/静态域不可达)→ 原生兜底页(骨架形态下
@@ -776,7 +776,11 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       showOfflineView(reason: "loader script failed to load")
     case "close":
       // H5 标题栏 ✕(壳声明 'close' 才画):宿主可拦截自管;默认按呈现形态退出
-      if delegate?.hecongChatDidRequestClose?() != true {
+      // 询问型 ⇒ 走既有的 `askHost`(门面优先、去重、任一方返回 true 即视为已拦截),
+      // 而不是两级扇出 —— 扇出对"返回值决定行为"的回调没有意义(谁的返回值算数?)。
+      // 同批修复:此前是 `delegate?.` 直调,只用门面的租户**拦不住关闭**(安卓侧门面能拦,
+      // 又一处两端不一致)。
+      if !askHost({ $0.hecongChatDidRequestClose?() == true }) {
         if presentingViewController != nil, navigationController?.viewControllers.count ?? 1 <= 1 {
           dismiss(animated: true)
         } else {
@@ -817,10 +821,36 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   /// 为什么需要:未读 / 匿名号这两件事**门面与视图都会报**(门面服务于"没打开聊天页"的场景,
   /// 视图服务于"只用视图不用门面"的场景)。租户常把同一个对象两边都设 —— 不去重就是
   /// **同一个回调触发两次**(未读角标闪两下 / 匿名号重复上报)。身份比较是最省事且不漏的去重法。
+  /// **只通知视图自己的 delegate**(与门面同一对象时跳过)。
+  ///
+  /// ⚠️ **绝大多数场景不该直接用它** —— 通知型请用 ``notifyFacadeAndOwn``,询问型用 ``askHost``。
+  /// 直接用本方法只有一种正当情形:**门面那一侧要走的不是"转发回调"而是"更新自己的状态"**,
+  /// 由那条路自己去回调门面 delegate,这里只补视图这一半。当前仅两处:
+  ///   · `unread` → `HecongChat.shared.applyUnread(count)`(门面要更新未读数并驱动轮询);
+  ///   · `anonymousIdChanged` → 门面要更新镜像号。
+  /// 写新回调时若只是"把这件事告诉宿主",一律走 ``notifyFacadeAndOwn``。
   private func notifyOwnDelegate(_ block: (HecongChatDelegate) -> Void) {
     guard let own = delegate else { return }
     if own === HecongChat.shared.delegate { return }
     block(own)
+  }
+
+  /// 门面 delegate + 视图 delegate **两级扇出**(去重由 [notifyOwnDelegate] 负责)。
+  ///
+  /// 🔴 2026-09-06 iOS 接入方实测抓出:`identified` / `user-reset` / `load-failed` 三组回调
+  /// 此前是 `delegate?.xxx` **直调**,只走视图自己的 delegate —— 而门面创建 VC 的四个入口
+  /// (`push` / `presentSheet` / `presentImmersive` / 带参重载)**都不会自动设 `vc.delegate`**,
+  /// 于是只用门面(`HecongChat.shared.configure(listener:)` + `push/presentSheet`)的租户
+  /// **永远收不到这三组回调**,而且静默 —— 这恰恰是我们文档推荐的主路径。
+  ///
+  /// ⚠️ 安卓侧没有这个问题:`HecongChatActivity` 里有 `view.listener = HecongChat.listener`,
+  /// 自动把门面 listener 接给视图。**两端行为不一致本身就是隐患**,本次按 iOS 补齐。
+  ///
+  /// ⚠️ 示范工程测不出来:`ChatLaunch.bind()` 手动设了 `chat.delegate` —— 又一次
+  /// 「示范工程做了真实租户不会做的事」(同 FileProvider / SwiftUI 那两次)。
+  func notifyFacadeAndOwn(_ block: (HecongChatDelegate) -> Void) {
+    if let facade = HecongChat.shared.delegate { block(facade) }
+    notifyOwnDelegate(block)
   }
 
   /// 打开外链。**白名单必须含 tel/mailto/sms**(2026-08-18 专项排查抓出的静默黑洞)。
@@ -882,7 +912,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     bootWait.detach() // 已判定失败 → 别在兜底页后面继续转(转圈=还有希望,兜底页=没戏了,两者互斥)
     HecongErrorReporter.shared.report(
       scope: "load", message: reason, channelId: config.channelId)
-    delegate?.hecongChatDidFailToLoad?(reason)
+    notifyFacadeAndOwn { $0.hecongChatDidFailToLoad?(reason) }
     let container = UIView(frame: view.bounds)
     container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     container.backgroundColor = .systemBackground

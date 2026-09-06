@@ -181,6 +181,10 @@ public protocol HecongChatDelegate: AnyObject {
   ///
   /// ⚠️ 只在真有被丢弃的字段时才回调;不实现也没关系 ——
   /// SDK 默认会打一条控制台警告,开发期直接看得到。
+  ///
+  /// ⏱ **什么时候会收到**(2026-09-06 安卓侧真机实测,两端同理):**客服页打开之后** ——
+  /// 校验发生在 H5 侧,页面没起来时 identify 只是在壳里排队(实测:冷启动 identify 后等
+  /// 12 秒没有,打开聊天页 1 秒内到)。所以**别指望"登录那一刻就知道字段传错了"**。
   @objc optional func hecongChatDidIgnoreCustomFields(_ ignoredKeys: [String])
 
   /// 消息内外链被点。返回 true = 宿主自行处理(内开浏览器页等);false / 未实现 = 壳跳系统浏览器
