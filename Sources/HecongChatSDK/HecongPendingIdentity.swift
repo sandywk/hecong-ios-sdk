@@ -26,6 +26,8 @@ final class HecongPendingIdentity {
   var hasIdentity: Bool { userId != nil }
 
   /// 记一次 identify:同一个人逐字段合并(PATCH,没传的字段不动),换了人整份替换。
+  /// (这里是**容器自身**的方法,与安卓 `HecongPendingIdentity.identify` 同名对位;
+  ///  下方协议的 `identifyRaw` 才是"下发给视图"的那条。)
   func identify(userId: String, profile: [String: Any]?, data: [String: Any]?) {
     if self.userId != userId {
       self.userId = userId
@@ -50,7 +52,9 @@ final class HecongPendingIdentity {
 /// 门面刻意**不认识具体的视图类** —— 只依赖这几个动作,将来若做原生 UI 或别的承载形态,
 /// 实现这个协议即可接入,门面零改动(workflow.md §10.4 公共面不可破坏的前置设计)。
 protocol HecongChatCommandTarget: AnyObject {
-  func identify(userId: String, profile: [String: Any]?, data: [String: Any]?)
+  /// 内部表示用字典(桥上就是 JSON)。**公共面不是这个** —— 租户面向 ``HecongProfile``
+  /// 类型化字段,由公共入口转换后落到这里(2026-09-06,与安卓 `identifyRaw` 对位)。
+  func identifyRaw(userId: String, profile: [String: Any]?, data: [String: Any]?)
   func resetUser()
   /// 通用命令透传(桥协议 §三.2)。身份两件保留具名方法是因为它们要过门面的合并容器;
   /// 其余命令一律走这条 —— **H5 将来新增命令时壳零改动**(具名方法只是便利糖)。

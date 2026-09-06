@@ -172,6 +172,17 @@ public protocol HecongChatDelegate: AnyObject {
   @objc optional func hecongChatDidIdentify(_ userId: String)
   @objc optional func hecongChatDidResetUser()
 
+  /// 本次 identify 里**被后端丢弃的 `data` 自定义字段名**(2026-09-06 加;与安卓
+  /// `onCustomFieldsIgnored` 对位)。
+  ///
+  /// 后端对 `data` 走**白名单**:只接受租户已在工作台「自定义字段」里定义并启用的 key,
+  /// 其余静默丢弃 —— 拼错一个键名的表现就是"资料没上去,但哪儿都不报错"。
+  /// 收到本回调 = 这几个 key 没生效,**去工作台把它们建出来,或改成正确的 key**。
+  ///
+  /// ⚠️ 只在真有被丢弃的字段时才回调;不实现也没关系 ——
+  /// SDK 默认会打一条控制台警告,开发期直接看得到。
+  @objc optional func hecongChatDidIgnoreCustomFields(_ ignoredKeys: [String])
+
   /// 消息内外链被点。返回 true = 宿主自行处理(内开浏览器页等);false / 未实现 = 壳跳系统浏览器
   @objc optional func hecongChat(handleOpenUrl url: URL) -> Bool
 

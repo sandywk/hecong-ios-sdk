@@ -116,7 +116,20 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
 
   // MARK: - 公共命令面(壳 → H5,桥协议 §三;ready 前调用自动排队)
 
-  @objc public func identify(userId: String, profile: [String: Any]?, data: [String: Any]?) {
+  /// 绑定会员 + 写资料(嵌入档的公共入口;用门面的租户调 ``HecongChat/identify(userId:profile:data:)``)。
+  ///
+  /// - Parameters:
+  ///   - profile: 系统内置四字段(姓名/头像/手机/邮箱)——**类型化,写错键名编译不过**
+  ///   - data: 租户在工作台「自定义字段」里自建的业务字段;**未定义的 key 会被后端丢弃**,
+  ///     丢了哪些经 ``HecongChatDelegate/hecongChatDidIgnoreCustomFields(_:)`` 回执,
+  ///     SDK 也会打一条控制台警告
+  @objc public func identify(
+    userId: String, profile: HecongProfile? = nil, data: [String: Any]? = nil
+  ) {
+    identifyRaw(userId: userId, profile: profile?.toDictionaryOrNil(), data: data)
+  }
+
+  func identifyRaw(userId: String, profile: [String: Any]?, data: [String: Any]?) {
     var payload: [String: Any] = ["userId": userId]
     if let profile = profile { payload["profile"] = profile }
     if let data = data { payload["data"] = data }
@@ -717,6 +730,14 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       }
     case "identified":
       if let userId = payload?["userId"] as? String { delegate?.hecongChatDidIdentify?(userId) }
+      // 后端白名单丢弃的自定义字段名 —— **默认就打警告**,不依赖租户实现回调:
+      // 这类问题的表现是"资料静默不生效",不主动喊一嗓子,租户只能去工作台逐字段核对。
+      // (网页端一直是 console.warn;iOS 侧此前连 H5 console 都不转发 = 完全看不见。)
+      let ignored = HecongIgnoredKeys.parse(payload)
+      if !ignored.isEmpty {
+        print("[HecongChat] 以下自定义字段未在工作台「自定义字段」中定义,已被忽略:\(ignored.joined(separator: ", "))")
+        delegate?.hecongChatDidIgnoreCustomFields?(ignored)
+      }
     case "user-reset":
       delegate?.hecongChatDidResetUser?()
     case "unread":

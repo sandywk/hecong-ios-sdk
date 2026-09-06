@@ -118,12 +118,17 @@ public final class HecongChat: NSObject {
   ///
   /// **可在聊天页打开之前调**(如 APP 登录成功那一刻)—— 身份会被记住(同一个人多次调用逐字段
   /// 合并),聊天页起来时自动补发一次,不需要租户自己挑时机。已经开着聊天页时立即生效。
+  /// - Parameters:
+  ///   - profile: 系统内置四字段(姓名/头像/手机/邮箱)——**类型化,写错键名编译不过**
+  ///   - data: 租户在工作台「自定义字段」里自建的业务字段;**未定义的 key 会被后端丢弃**,
+  ///     丢了哪些经 ``HecongChatDelegate/hecongChatDidIgnoreCustomFields(_:)`` 回执
   @objc public func identify(
-    userId: String, profile: [String: Any]? = nil, data: [String: Any]? = nil
+    userId: String, profile: HecongProfile? = nil, data: [String: Any]? = nil
   ) {
     guard !userId.isEmpty else { return }
-    pendingIdentity.identify(userId: userId, profile: profile, data: data)
-    forEachTarget { $0.identify(userId: userId, profile: profile, data: data) }
+    let dict = profile?.toDictionaryOrNil()
+    pendingIdentity.identify(userId: userId, profile: dict, data: data)
+    forEachTarget { $0.identifyRaw(userId: userId, profile: dict, data: data) }
   }
 
   /// 退出登录:清身份 + 结束当前对话。**APP 登出时必须调** ——
@@ -511,7 +516,7 @@ public final class HecongChat: NSObject {
     pendingShell.replay(into: target)
     guard let userId = pendingIdentity.userId else { return }
     // 重放一条合并后的 identify(同一个人多次调用已逐字段合并,详 HecongPendingIdentity 头注释)
-    target.identify(
+    target.identifyRaw(
       userId: userId,
       profile: pendingIdentity.profile.isEmpty ? nil : pendingIdentity.profile,
       data: pendingIdentity.data.isEmpty ? nil : pendingIdentity.data)
