@@ -482,7 +482,8 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     // 占位转圈跟着每一次 load 走(含兜底页的"重试"):这段等待每次都存在,不只首次进场。
     // ⚠️ 挂在 **VC 的 view** 上,不是挂进 WebView —— 往 WKWebView 里 addSubview 会被它自己的
     // 内容层盖住(实测一帧都看不到);当兄弟视图叠在上面才画得出来。
-    bootWait.attach(to: view)
+    // 明暗取唯一解析点(与容器垫色 / 骨架底色同源),圈自己不猜
+    bootWait.attach(to: view, dark: resolvedColorScheme() == "dark")
     webView?.load(URLRequest(url: skeletonPageUrl()))
   }
 
@@ -693,7 +694,9 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       keyboardGuard?.modeDidChange() // 老 H5 缩过的 frame → 新 H5 要满高,重铺一次
       isBridgeReady = true
       cancelReadyWatchdog()
-      bootWait.detach() // 真实画面已就位,占位让位(桥 ready 是壳能拿到的最早"H5 活了"的信号)
+      // 真实画面已就位,占位让位(桥 ready 是壳能拿到的最早"H5 活了"的信号)。
+      // 淡出交接:H5 同位置接着转它自己的同款圈(见 HecongBootWaitView 头注释)
+      bootWait.handOff()
       // 躺在备用页池里期间重建的桥(预热首次 ready / 渲染进程被回收后重载)并不知道没人在看,
       // 必须补一句 —— 否则后端把这个访客算成在线(见 isSuspendedInPool 注释)
       if isSuspendedInPool { send(lifecycleCommand("background")) }
