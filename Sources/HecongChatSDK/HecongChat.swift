@@ -36,7 +36,8 @@ public final class HecongChat: NSObject {
   private let pendingIdentity = HecongPendingIdentity()
 
   /// 待重放壳状态(指派技能组 / 注册按钮;详 HecongPendingShellState)
-  private let pendingShell = HecongPendingShellState()
+  /// 模块内可见:`HecongChat+Presend.swift` 扩展要用(不对外)
+  let pendingShell = HecongPendingShellState()
 
   /// 已挂载的聊天视图。**弱引用表** —— 门面是单例、生命周期与 APP 同,强引用会把
   /// 关掉的聊天页永久留在内存里(经典单例泄漏)。视图可同时存在多个(见 setChatVisible)。
@@ -528,11 +529,11 @@ public final class HecongChat: NSObject {
   }
 
   /// 当前有没有活着的聊天视图(命令有没有接收方)
-  private var hasLiveTarget: Bool {
+  var hasLiveTarget: Bool {
     targets.allObjects.contains { $0 is HecongChatCommandTarget }
   }
 
-  private func forEachTarget(_ block: (HecongChatCommandTarget) -> Void) {
+  func forEachTarget(_ block: (HecongChatCommandTarget) -> Void) {
     for case let t as HecongChatCommandTarget in targets.allObjects { block(t) }
   }
 

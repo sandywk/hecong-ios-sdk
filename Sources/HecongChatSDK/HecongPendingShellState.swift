@@ -8,6 +8,8 @@
 //   - routing:最后一次的值(覆盖式)
 //   - 注册按钮:全量 Map(同 id 覆盖,注销即删)—— 视图重建后按钮必须还在,否则点开聊天
 //     页发现"发送商品"没了,而租户代码早在启动时就注册过一次,不会再注册第二次
+//   - 带入内容(setPresend):**一次性**。字段各自合并(先带文字、后带卡片不互相冲掉),
+//     重放一次即清 —— 访客发了 / 关了之后视图重建不该再冒出来(web-sdk-presend.md §七)
 //   - 选择器数据:**刻意不重放**。它是"点按钮那一刻现取"的易变数据(库存/登录态),
 //     缓存重放等于把陈旧列表推给下一个会话;真需要时租户在 didClickAction 回调里现给。
 
@@ -21,6 +23,18 @@ final class HecongPendingShellState {
 
   func setRouting(_ routing: HecongRouting?) {
     self.routing = routing
+  }
+
+  /// 待重放的带入内容(`{ text?, card? }`);nil = 没有
+  private(set) var presend: [String: Any]?
+
+  /// 聊天页没开时登记(字段合并);nil = 撤掉尚未生效的
+  func mergePresend(_ payload: [String: Any]?) {
+    guard let payload = payload else {
+      presend = nil
+      return
+    }
+    presend = (presend ?? [:]).merging(payload) { _, new in new }
   }
 
   func registerAction(_ payload: [String: Any]) {
@@ -41,5 +55,9 @@ final class HecongPendingShellState {
     for payload in actions.values {
       target.sendCommand("registerAction", payload: payload)
     }
+    if let presend = presend {
+      target.sendCommand("setPresend", payload: ["presend": presend])
+    }
+    presend = nil
   }
 }
