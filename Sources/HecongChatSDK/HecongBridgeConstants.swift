@@ -9,7 +9,7 @@ import Foundation
 
 enum HecongBridgeConstants {
   /// 壳包版本(context.shellVersion,诊断/灰度用;发版时更新)
-  static let shellVersion = "0.7.0"
+  static let shellVersion = "0.8.0"
 
   /// document-start 注入的 context 全局 key(桥协议 §二)
   static let contextKey = "__hecongAppContext"
@@ -30,9 +30,11 @@ enum HecongBridgeConstants {
   /// 壳转给宿主的通吃回调 + 常用具名回调。加新事件只动 H5 清单,壳零改动。
   /// 'header-style':H5 告诉壳"当前顶栏是深底还是浅底"→ 壳切状态栏图标黑白。
   /// 只在沉浸档有意义(标准档顶栏是原生的,壳自己知道颜色)。app-sdk-chat-entry.md §5.2
+  /// 'boot-ring':首屏的圈壳来画(原生圈),H5 首屏别画、首屏结束发 `content-shown`
+  /// (link-sdk-app-bridge.md §四.2;壳侧状态机 HecongBootRingState)
   static let capabilities = [
     "permission-gate", "badge", "download", "open-url", "close", "header", "session-events",
-    "header-style",
+    "header-style", "boot-ring",
   ]
 
   /// 桥协议 context 结构版本
@@ -54,13 +56,53 @@ enum HecongBridgeConstants {
   /// 反过来写死 "production" 同样错:我们自己跑示范 APP 的错误会污染线上数据。
   /// 源码分发下这个宏取决于**租户编译时的构建配置**:他们 Debug 调试 → development,
   /// Release 上架 → production,正是我们想要的分界。
-  static let errorEnvironment: String = {
+  static let errorEnvironment: String = isDebugBuild ? "development" : "production"
+
+  /// 宿主是不是调试构建(源码分发下跟随**租户编译时的构建配置**,理由同上)。
+  /// errorEnvironment 与 context.app.debug 共用这一个判法。
+  static let isDebugBuild: Bool = {
     #if DEBUG
-      return "development"
+      return true
     #else
-      return "production"
+      return false
     #endif
   }()
+
+  /// 是否模拟器 —— 编译期判定,可靠(模拟器的 WKWebView UA 与真机一样,运行时分不出)。
+  static let isSimulator: Bool = {
+    #if targetEnvironment(simulator)
+      return true
+    #else
+      return false
+    #endif
+  }()
+
+  /// context 里与本次装载无关的固定部分(结构版本 / 壳版本 / 能力 / 宿主环境);
+  /// 随装载变化的(深浅色 / 匿名号 / 登出重置)由 HecongChatViewController.buildContextScript 叠加。
+  static func baseContext() -> [String: Any] {
+    var ctx: [String: Any] = [
+      "v": contextVersion, "shellVersion": shellVersion, "capabilities": capabilities,
+    ]
+    if let app = appEnv() { ctx["app"] = app }
+    return ctx
+  }
+
+  /// 宿主环境(context.app)—— 签票时随请求上报,后端据此判渠道「已接通 / 示范 App 试通」。
+  ///
+  /// 🔴 **只做观测,不参与准入**(2026-10-29;link-sdk-app-bridge.md §二.3)。墓碑里删掉的 bundleId
+  /// 是「包名白名单准入凭据」;这次的 appId 只用来认出示范 App,伪造最多让「已接通」标错,够不着权限。
+  /// 两个出口共用:聊天页 context 注入 + 未读角标原生直发的 token 请求。
+  /// 拿不到 bundleId(极端路径)→ nil,整个不带,后端退化按 UA 判。
+  static func appEnv(bundleId: String? = Bundle.main.bundleIdentifier) -> [String: Any]? {
+    guard let appId = bundleId, !appId.isEmpty else { return nil }
+    return [
+      "shellVersion": shellVersion,
+      "os": "ios",
+      "simulator": isSimulator,
+      "debug": isDebugBuild,
+      "appId": appId,
+    ]
+  }
 
   // MARK: - 本地骨架装载(2026-08-17 改版:APP 内置骨架 + 静态域拉插座,app-sdk-plan §二)
 
@@ -123,9 +165,26 @@ enum HecongBridgeConstants {
     html,body{margin:0;height:100%;background:\(lightBackdrop)}
     @media (prefers-color-scheme: dark){html,body{background:\(darkBackdrop)}}
     </style></head>
-    <body><script src="\(loaderUrl)" onerror="webkit.messageHandlers.\(iosHandlerName).postMessage({type:'loader-error'})"></script></body></html>
+    <body><script>\(noticeObserverScript)</script><script src="\(loaderUrl)" onerror="webkit.messageHandlers.\(iosHandlerName).postMessage({type:'loader-error'})"></script></body></html>
     """
   }
+
+  /// 骨架页观察脚本(壳内部信号 `notice-shown`,不属 H5 桥协议;link-sdk-app-bridge.md §四.2.5)。
+  ///
+  /// body 直接子节点出现 `role="alert"`(= 整页提示:插座提示页 / 测试链接判死页 / 渠道配错页,
+  /// 都走 link-notice.ts 那两处)就发**一次** `notice-shown` 并停止观察 → 壳任何时候都收首屏圈。
+  /// 原生圈在 WebView 之上,网页里画什么都盖不住它,不接这条提示页上会叠圈最多 60s。
+  ///
+  /// 🔴 **必须放在 `<body>` 里、插座 `<script src>` 之前**(skeletonHtml 那样):放 `<head>` 时
+  /// `document.body` 是 null,判空跳过 = 静默不装,整条信号失效(HecongSkeletonHtmlTests 钉位置)。
+  /// 只看直接子节点(`childList`,不看子树):聊天窗内部的 `role=alert` 不算整页提示。
+  static let noticeObserverScript =
+    "(function(){var b=document.body;if(!b||!window.MutationObserver)return;"
+    + "var o=new MutationObserver(function(ms){for(var i=0;i<ms.length;i++){var a=ms[i].addedNodes;"
+    + "for(var j=0;j<a.length;j++){var n=a[j];"
+    + "if(n.nodeType===1&&n.getAttribute('role')==='alert'){o.disconnect();"
+    + "try{webkit.messageHandlers.\(iosHandlerName).postMessage({type:'notice-shown'})}catch(e){}return}}}});"
+    + "o.observe(b,{childList:true})})();"
 
   /// 预下载清单的文件名 —— 与 TS 侧 `shared-utils/src/prewarm-manifest-path.ts` 的
   /// `PREWARM_MANIFEST` **必须逐字一致**(跨语言契约只能靠纪律,同本文件其余桥常量)。

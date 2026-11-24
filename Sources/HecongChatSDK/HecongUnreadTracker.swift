@@ -125,12 +125,8 @@ final class HecongUnreadTracker {
     req.timeoutInterval = 15
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.setValue(channelId, forHTTPHeaderField: "X-Channel-Id")
-    let body: [String: Any] = [
-      "channelId": channelId,
-      "anonymousId": anonymousId,
-      // 自报壳类型必须与渠道 platform 一致,否则后端 400 VAL_PLATFORM_MISMATCH(桥协议 §二.1)
-      "platform": "app",
-    ]
+    let body = Self.tokenBody(
+      channelId: channelId, anonymousId: anonymousId, app: HecongBridgeConstants.appEnv())
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
     URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
       if let error = error {
@@ -150,6 +146,19 @@ final class HecongUnreadTracker {
       }
       completion(token)
     }.resume()
+  }
+
+  /// token 请求 body(与 H5 侧 token-fetcher 同形)。`app` 刻意无默认值:漏传 = 编译失败。
+  static func tokenBody(channelId: String, anonymousId: String, app: [String: Any]?) -> [String: Any] {
+    var body: [String: Any] = [
+      "channelId": channelId,
+      "anonymousId": anonymousId,
+      // 自报壳类型必须与渠道 platform 一致,否则后端 400 VAL_PLATFORM_MISMATCH(桥协议 §二.1)
+      "platform": "app",
+    ]
+    // 与聊天页同一份宿主环境(后端判渠道接通;仅观测,HecongBridgeConstants.appEnv)
+    if let app = app { body["context"] = ["app": app] }
+    return body
   }
 
   /// GET /sdk/precheck —— 拿未读数。失败静默(容错优先,precheck 本就是"乐观快照"不是承诺)。

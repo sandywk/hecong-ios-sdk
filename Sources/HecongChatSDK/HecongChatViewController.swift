@@ -15,8 +15,9 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   private let idStore: HecongAnonymousIdStore
   private var webView: WKWebView?
   private var offlineView: UIView?
-  /// 进站占位转圈(原生画;**不能写在骨架 HTML 里**,病因见 `HecongBootWaitView` 头注释)
-  private let bootWait = HecongBootWaitView()
+  /// 首屏圈(原生画;**不能写在骨架 HTML 里**,病因见 `HecongBootWaitView` 头注释)。
+  /// 每个 VC 一份状态机;VC 只在事件发生处 feed(app-sdk-plan.md §十一,接线见 HecongBootRingDriver)
+  private var bootRing: HecongBootRingDriver?
   /// 承载形态(门面 `HecongChat.push/presentImmersive` 设;直接 new VC = 标准档)。
   /// true = 沉浸档:整页交给 H5(渠道模板那条标题栏 + 右上 ✕),壳不画顶栏。
   var immersive = false
@@ -90,7 +91,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   @objc public func destroy() {
     HecongChat.shared.detachTarget(self)
     cancelReadyWatchdog()
-    bootWait.detach() // 连同它的两个延时任务一起清(code-style §5:timer 必须在销毁路径 clear)
+    bootRing?.feed(.destroy) // 状态机 cancelAll + 摘圈(code-style §5:timer 必须在销毁路径 clear)
     guard let wv = webView else { return }
     wv.evaluateJavaScript(
       "window.\(HecongBridgeConstants.bridgeKey)&&window.\(HecongBridgeConstants.bridgeKey).destroy()",
@@ -277,6 +278,11 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
             + "d.style.setProperty('--hc-app-inset-bottom','\(insetPx)px');}",
           completionHandler: nil)
       })
+    bootRing = HecongBootRingDriver(host: view, webView: wv) { [weak self] in
+      HecongErrorReporter.shared.report(scope: "load", message: $0, channelId: self?.config.channelId)
+    }
+    // 首屏圈圆心 = WebView frame 中心(§11.3):跟 frame 的唯一设置点走,不在 viewDidLayoutSubviews 另设一处
+    keyboardGuard?.onWebViewFrameChange = bootRing?.webViewFrameDidChange
   }
 
   /// 状态栏图标黑白 —— **沉浸档**才由我们决定(那时屏幕最顶是 H5 的标题栏,壳看不见它的颜色,
@@ -384,12 +390,15 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   func poolWillSuspend() {
     isSuspendedInPool = true
     send(lifecycleCommand("background"))
+    // 加载中途退出入池时首屏圈可能还在:暂停计时与转圈,端出来从剩余时间接着算(§11.4 T12)
+    bootRing?.feed(.poolSuspend)
   }
 
   /// 端出池:人回来了,把在线状态喊回去。
   func poolDidResume() {
     isSuspendedInPool = false
     send(lifecycleCommand("foreground"))
+    bootRing?.feed(.poolResume)
   }
 
   // MARK: - APP 前后台联动(桥协议 §六)
@@ -417,6 +426,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   /// 压根没发出去,iOS 侧就退化成"看运气"。这不是"后台保活":范围是一条命令、有明确终止
   /// 条件(JS 执行完即还),跟"我们不做后台保活"是两回事。
   @objc private func hostDidEnterBackground() {
+    bootRing?.feed(.hostBackground) // 首屏圈后台不计时(app-sdk-plan §11.4 T12)
     guard webView != nil else { return }
     beginBackgroundTask()
     send(lifecycleCommand("background")) { [weak self] in
@@ -425,13 +435,14 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   }
 
   @objc private func hostWillEnterForeground() {
-    guard webView != nil else { return }
+    // 首屏圈:池与后台是两个独立的暂停原因,池里也照喂(只清后台标志,池没出不续表)
+    bootRing?.feed(.hostForeground)
     // 🔴 **躺在备用页池里时绝不喊 foreground**(2026-08-27 审查抓出)。
     // 场景:用户聊完退出(入池 → 已喊 background,后端知道人走了)→ 把 APP 切后台 → 再切回前台。
     // 此刻本 VC 还活着、通知照收,喊一句 foreground 就会让 H5 复连 WS、后端把访客算成在线 ——
     // **而用户根本没打开聊天页**。假在线从这条路溜进来,比入池那次更隐蔽(它不在打开/关闭路径上)。
     // 真正回前台的时机由 `poolDidResume()` 负责(端出池那一刻),不是 APP 切回来那一刻。
-    guard !isSuspendedInPool else { return }
+    guard webView != nil, !isSuspendedInPool else { return }
     send(lifecycleCommand("foreground"))
   }
 
@@ -479,11 +490,9 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     offlineView = nil
     isBridgeReady = false
     startReadyWatchdog()
-    // 占位转圈跟着每一次 load 走(含兜底页的"重试"):这段等待每次都存在,不只首次进场。
-    // ⚠️ 挂在 **VC 的 view** 上,不是挂进 WebView —— 往 WKWebView 里 addSubview 会被它自己的
-    // 内容层盖住(实测一帧都看不到);当兄弟视图叠在上面才画得出来。
-    // 明暗取唯一解析点(与容器垫色 / 骨架底色同源),圈自己不猜
-    bootWait.attach(to: view, dark: resolvedColorScheme() == "dark")
+    // 🪦 首屏圈**不在这里挂**(2026-11-24,§11.4):挂圈只在主框架开始导航(didStartProvisionalNavigation)
+    // 一处 —— 网络异常页点「刷新」(H5 自己 location.reload,不经壳)、进程被杀重载都要重挂,
+    // 只有导航开始这一点全覆盖。load() 到导航开始之间几 ms 无圈,无影响(圈本来 0.4s 后才出现)。
     webView?.load(URLRequest(url: skeletonPageUrl()))
   }
 
@@ -551,13 +560,11 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   }
 
   /// context 注入脚本(桥协议 §二)。墓碑(2026-08-17):曾带凭据字段 bundleId/appPlatform
-  /// (包名白名单校验)→ 议题当天关闭删除(客户端自报不可验真,零防护价值),别复活。
+  /// (包名白名单校验)→ 议题当天关闭删除(客户端自报不可验真,零防护价值),**作准入凭据**别复活。
+  /// ⚠️ 2026-10-29 起 `app.appId` 又带 bundleId —— 那次删的是准入凭据,这次**仅观测**
+  /// (见 HecongBridgeConstants.appEnv 与 link-sdk-app-bridge.md §二.3)。
   private func buildContextScript() -> String {
-    var ctx: [String: Any] = [
-      "v": HecongBridgeConstants.contextVersion,
-      "shellVersion": HecongBridgeConstants.shellVersion,
-      "capabilities": HecongBridgeConstants.capabilities,
-    ]
+    var ctx = HecongBridgeConstants.baseContext()
     // 深浅色档位语义(theming §7.3.1 三档链):context 注入 = **显式声明**,会压过渠道 config。
     // ⚠️ 墓碑:曾把 **auto** 解析成具体值注入 → 渠道配 dark 被壳压回浅色。auto 必须零注入;
     // 想"跟随宿主"用 host 档(默认),两者语义不同,别再合并。
@@ -583,10 +590,6 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     case "auto": return nil
     default: return hostIsDark() ? "dark" : "light" // host(默认)与未知值都按跟随宿主处理
     }
-  }
-
-  private func resolvedColorScheme() -> String {
-    explicitScheme() ?? (hostIsDark() ? "dark" : "light")
   }
 
   /// 宿主 APP 当前是不是深色 —— `host` 档的取值源。
@@ -689,14 +692,14 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
         HecongChat.shared.cacheApiBase(apiBase)
       }
       // H5 能力声明(桥协议 §四):认不认键盘遮挡变量,决定键盘让位由谁做(见 h5KeyboardInset)
-      h5KeyboardInset =
-        (payload?["capabilities"] as? [Any])?.contains { ($0 as? String) == "keyboard-inset" } ?? false
+      let h5Caps = (payload?["capabilities"] as? [Any])?.compactMap { $0 as? String } ?? []
+      h5KeyboardInset = h5Caps.contains("keyboard-inset")
       keyboardGuard?.modeDidChange() // 老 H5 缩过的 frame → 新 H5 要满高,重铺一次
       isBridgeReady = true
       cancelReadyWatchdog()
-      // 真实画面已就位,占位让位(桥 ready 是壳能拿到的最早"H5 活了"的信号)。
-      // 淡出交接:H5 同位置接着转它自己的同款圈(见 HecongBootWaitView 头注释)
-      bootWait.handOff()
+      // 首屏圈(桥协议 §四.2):H5 声明 'boot-ring' = 本页首屏没画圈、会发 content-shown → 接着转;
+      // 没声明(老 H5)→ 120ms 淡出交接,H5 同位置画它自己的圈(退回路径)
+      bootRing?.feed(.ready(bootRing: h5Caps.contains("boot-ring")))
       // 躺在备用页池里期间重建的桥(预热首次 ready / 渲染进程被回收后重载)并不知道没人在看,
       // 必须补一句 —— 否则后端把这个访客算成在线(见 isSuspendedInPool 注释)
       if isSuspendedInPool { send(lifecycleCommand("background")) }
@@ -760,9 +763,7 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
     case "download":
       if let raw = payload?["url"] as? String, let url = URL(string: raw) {
         let filename = payload?["filename"] as? String
-        if !askHost({ $0.hecongChat?(handleDownload: url, filename: filename) == true }) {
-          openExternally(url)
-        }
+        if !askHost({ $0.hecongChat?(handleDownload: url, filename: filename) == true }) { openExternally(url) }
       }
     case "event":
       // 会话事件信封(capability 'session-events'):具名回调 + 通吃,详 HecongSessionEvents
@@ -773,6 +774,10 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
       if let id = payload?["id"] as? String, !id.isEmpty {
         notifyFacadeAndOwn { $0.hecongChat?(didClickAction: id) }
       }
+    case "content-shown": // 首屏结束(只发给声明过 'boot-ring' 的页面)→ 首屏圈淡出;reason 只记日志
+      bootRing?.feed(.contentShown, note: payload?["reason"] as? String)
+    case "notice-shown": // 骨架页观察脚本(壳内部信号,不属 H5 协议):整页提示 → 任何时候都收圈
+      bootRing?.feed(.noticeShown)
     case "loader-error":
       // 骨架里插座 script 拉取失败(断网/静态域不可达)→ 原生兜底页(骨架形态下
       // didFailProvisionalNavigation 不会触发 —— 骨架是本地承载永远"导航成功")
@@ -912,36 +917,11 @@ public final class HecongChatViewController: UIViewController, HecongChatCommand
   private func showOfflineView(reason: String = "load failed") {
     // 只报一次(offlineView 已在 = 同一次失败的重复回调),同时透给宿主自行上报/换 UI
     guard offlineView == nil else { return }
-    bootWait.detach() // 已判定失败 → 别在兜底页后面继续转(转圈=还有希望,兜底页=没戏了,两者互斥)
+    bootRing?.feed(.failed) // 已判定失败 → 直接摘圈(转圈=还有希望,兜底页=没戏了,两者互斥)
     HecongErrorReporter.shared.report(
       scope: "load", message: reason, channelId: config.channelId)
     notifyFacadeAndOwn { $0.hecongChatDidFailToLoad?(reason) }
-    let container = UIView(frame: view.bounds)
-    container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    container.backgroundColor = .systemBackground
-
-    let zh = Locale.preferredLanguages.first?.hasPrefix("zh") == true
-    let label = UILabel()
-    label.text = zh ? "网络不可用,请检查网络后重试" : "Network unavailable. Please check and retry."
-    label.textColor = .secondaryLabel
-    label.font = .systemFont(ofSize: 15)
-    label.numberOfLines = 0
-    label.textAlignment = .center
-
-    let button = UIButton(type: .system)
-    button.setTitle(zh ? "重试" : "Retry", for: .normal)
-    button.addTarget(self, action: #selector(load), for: .touchUpInside)
-
-    let stack = UIStackView(arrangedSubviews: [label, button])
-    stack.axis = .vertical
-    stack.spacing = 16
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    container.addSubview(stack)
-    NSLayoutConstraint.activate([
-      stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-      stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-      stack.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 32),
-    ])
+    let container = HecongOfflineView.make(frame: view.bounds, retryTarget: self, retryAction: #selector(load))
     view.addSubview(container)
     offlineView = container
   }
@@ -1012,6 +992,9 @@ extension HecongChatViewController: WKNavigationDelegate {
     h5KeyboardInset = false
     keyboardGuard?.pageDidReset()
     keyboardGuard?.modeDidChange()
+    // 首屏圈唯一挂圈点(幂等:已挂着不重挂、不重置计时;§11.4 T1 / T3 / T15)。
+    // 放在 modeDidChange 之后:挂圈时按此刻的 webView.center 先定一次位(之后跟 frame 回调走)
+    bootRing?.feed(.navStart)
   }
 
   /// WebContent 进程被系统回收(内存吃紧时 iOS 会直接杀掉 WebView 的渲染进程)。

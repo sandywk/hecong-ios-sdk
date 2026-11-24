@@ -49,6 +49,11 @@ final class HecongKeyboardLayoutGuard {
   /// 上次注入值(变了才发 JS —— 停稳/无键盘时零 JS,同安卓 injected 去重)
   private var lastInjected: (kb: Int, inset: Int)?
   private var insetObservation: NSKeyValueObservation?
+  /// WebView frame 刚被设过(本类是 frame 的唯一设置点:布局 / 旋转 / ready 与导航开始 / 键盘逐帧)。
+  /// VC 在这里让首屏圈跟着 WebView 中心走(app-sdk-plan.md §11.3)—— 不在 viewDidLayoutSubviews
+  /// 另设一处:圈会活过 ready,带着键盘推进时 ready 那一刻 frame 从缩过变回满高,只挂布局回调圆心会跳。
+  /// 兜底模式下本回调在键盘动画块里被调,圈的位移随之同曲线动画。
+  var onWebViewFrameChange: (() -> Void)?
   private var offsetObservation: NSKeyValueObservation?
 
   init(
@@ -179,6 +184,7 @@ final class HecongKeyboardLayoutGuard {
       x: 0, y: top,
       width: host.bounds.width,
       height: max(0, host.bounds.height - top - bottomCut))
+    onWebViewFrameChange?()
   }
 
   /// 钳零 WKWebView 自带的键盘规避(第三所有者,两种模式都要)。

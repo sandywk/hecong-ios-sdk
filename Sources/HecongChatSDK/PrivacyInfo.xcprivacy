@@ -24,6 +24,9 @@
   只声明**SDK 自身会传输**的数据。其中「姓名/邮箱/电话」是**接入方主动调 identify 传入**的
   可选资料 —— SDK 不主动采集,但确实会传输,按苹果口径仍需声明。
   ⚠️ 声明这三项会体现在接入方的 App Store 隐私标签上;若将来产品口径调整,这里要同步。
+
+  签票请求里的 context.app(宿主 bundleId / 是否模拟器 / 是否调试包 / 壳版本,2026-10-29)是**宿主 App
+  自身**的属性,不是用户数据,也不关联到人,不需要新增数据类型(诊断类已由 OtherDiagnosticData 覆盖)。
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
